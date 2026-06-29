@@ -451,7 +451,7 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
     return { job_id: job.job_id, type: job.job_type, queue: job.queue, status: job.status, attempts: job.attempts, result: job.result, error: job.error, events: await queue.getEvents(id) };
   });
 
-  app.post("/v1/withdrawals/prepare", async (request) => { await assertRootHealthy(store); return createWithdrawal(request, store); });
+  app.post("/v1/withdrawals/prepare", async (request) => { const userId = await authedUser(store, request); await assertRootHealthy(store); return createWithdrawal(request, store, userId); });
   // PHASE 7: build the UNSIGNED Soroban withdraw XDR for the user's Stellar wallet
   // (Freighter/Privy) to sign client-side. The backend never holds the user secret.
   app.post("/v1/withdrawals/build-xdr", async (request) => {
@@ -465,6 +465,7 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   });
   // Submit a prepared withdraw proof via the relayer (pool.withdraw on-chain).
   app.post("/v1/withdrawals/submit", async (request) => {
+    await authedUser(store, request); // FIX7
     await assertRootHealthy(store);
     const b = (request.body ?? {}) as Record<string, unknown>;
     const job = await queue.enqueue("relayer", "WITHDRAW_PUBLIC_SUBMIT", b, b.idempotency_key ? `wd-submit:${b.idempotency_key}` : undefined);
@@ -665,7 +666,7 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   app.get("/v1/test-report/latest", async () => ({ path: "docs/test-report.generated.md" }));
 }
 
-async function createWithdrawal(request: FastifyRequest, store: Store) {
+async function createWithdrawal(request: FastifyRequest, store: Store, userId: string) {
   const body = withdrawalSchema.parse(request.body);
   const idempotencyKey = idem(request);
   const withdrawalId = deterministicId({ namespace: "wd", parts: [idempotencyKey, body.nullifier] });
@@ -677,11 +678,11 @@ async function createWithdrawal(request: FastifyRequest, store: Store) {
     recipient: body.recipient,
     relayer_fee: body.relayer_fee,
     deadline_ledger: body.deadline_ledger,
+    user_id: userId,
     state: "prepared"
   });
   await store.transition({ entityType: "withdrawal", entityId: withdrawalId, toState: "prepared" });
-  const userId = await authedUserOptional(store, request);
-  if (userId) { await store.setRowUser("withdrawals", "withdrawal_id", withdrawalId, userId); await store.logActivity(userId, { event_type: "withdrawal.prepare", entity_type: "withdrawal", entity_id: withdrawalId }); }
+  await store.logActivity(userId, { event_type: "withdrawal.prepare", entity_type: "withdrawal", entity_id: withdrawalId });
   return { withdrawal_id: withdrawalId };
 }
 

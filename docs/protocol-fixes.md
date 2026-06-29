@@ -280,20 +280,32 @@ proof loop → RFQ → activity → logout) — PASS.
   incl. live audit.
 - `npm run services:test` aggregates prover + relayer + root-auditor — all PASS.
 
-The **service/queue/API layer** of PHASE 2 is COMPLETE. However, an audit
-(`audit.md`) defines the **product wallet architecture** as the real Phase-2
-deliverable, and that is an IN-PROGRESS rebuild — do not read "PHASE 2 complete" as
-covering it. Specifically still being built:
-- Privy-first identity (the custom wallet-nonce auth becomes dev-only behind
-  `ENABLE_LEGACY_WALLET_AUTH`); backend verifies Privy access tokens.
-- Browser **note vault** with a random master key + recovery wrappers (passkey
-  PRF / Stellar Ed25519 / recovery-kit; EVM diagnostic-only). `packages/note-vault`.
-- **User-signed** CCTP deposits (no backend EVM key in the user path) + relayer
-  validation of the user burn tx (`CCTP_INBOUND_AFTER_USER_BURN`).
-- **User-signed** Stellar spends (Freighter/Privy), removing `STELLAR_USER_SECRET`
-  from app routes.
-- Next.js `apps/web`, package cleanup (services off `apps/cli`), Docker, security
-  gates. See `docs/app-wallet-architecture.md` + `docs/blockers.md` for live status.
+The **service/queue/API layer** of PHASE 2 is complete. The **product wallet
+architecture** (`audit.md`) was then built and subsequently audited (`audit2.md`),
+which found 12 P0 gaps in the first wallet pass. Those P0 fixes are now applied and
+gated by `npm run phase2:acceptance` (all offline tests PASS):
+- Privy-first identity; vault uses the real **Privy DID** (`/v1/me.privy_user_id`),
+  not the local UUID. Custom wallet-nonce auth is dev-only behind
+  `ENABLE_LEGACY_WALLET_AUTH`.
+- **Real backup verification**: client fetch → unwrap → decrypt → compare, then a
+  non-empty proof-of-decrypt is required by the backend (empty/insufficient-policy
+  rejected). Browser **note vault** with random master key + wrappers
+  (`packages/note-vault`).
+- **User-signed** CCTP deposit: the user's wallet signs approve + burn via viem (no
+  `prompt`, no backend EVM key); the relayer validates the burn and **completes the
+  Stellar side** (`CCTP_INBOUND_AFTER_USER_BURN`: attestation → mint_and_forward →
+  DepositNoteMint proof → receive_cctp_deposit).
+- **User-signed** Stellar spends (Freighter); `STELLAR_USER_SECRET`/`toSecret`
+  removed from all service runtime.
+- **All user-owned state-changing routes require Privy auth + ownership** (27/27
+  route-auth checks); **Privy wallet sync** added; **RFQ** intent/accept hardened;
+  **dev/legacy routes** gated behind `ENABLE_DEV_ROUTES`.
+- Next.js `apps/web`; services import packages, not `apps/cli`; Docker compose
+  config validates; security gates expanded (behavioral). See
+  `docs/test-report.generated.md` for the PASS/NOT-RUN matrix.
 
-Tracked enhancements (not blockers): full RFQ on-chain lifecycle STATE
-(quote/intent registries) and true per-step CCTP_INBOUND decomposition.
+NOT claimed (require external resources): live Docker `up`, live UI e2e, and the
+live user-signed testnet tx run (needs funded wallets + Freighter). Tracked
+enhancements (not blockers): full RFQ on-chain lifecycle STATE registries,
+true per-step CCTP_INBOUND decomposition, Privy Stellar Tier-2 raw signing,
+proof-authorized no-Stellar-wallet exit.

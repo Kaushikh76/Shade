@@ -36,20 +36,58 @@ const gates: Gate[] = [
     name: "operator-driven deposit is gated (ENABLE_OPERATOR_TESTNET_DEPOSIT)",
     cmd: `grep -rn "ENABLE_OPERATOR_TESTNET_DEPOSIT" apps/relayer/src/worker.ts || echo MISSING_GATE`,
     // here a MATCH is REQUIRED; invert below
+  },
+  // FIX11 audit2: deeper behavioral gates.
+  {
+    name: "deposit page has NO paste-burn-hash prompt",
+    // match real prompt() calls, not the word in a // comment
+    cmd: `grep -rn 'prompt(' apps/web/src/app/deposit/page.tsx | grep -v '^[^:]*:[0-9]*://' || true`
+  },
+  {
+    name: "deposit page sends wallet transactions (sendTransaction)",
+    cmd: `grep -rln "sendTransaction" apps/web/src/app/deposit/page.tsx | grep -q . && echo "" || echo MISSING_SENDTX`,
+    // MATCH of MISSING_SENDTX means failure
+  },
+  {
+    name: "restore page fetches envelope + decrypts",
+    cmd: `( grep -q "getVault" apps/web/src/app/restore/page.tsx && grep -q "decryptEnvelope" apps/web/src/app/restore/page.tsx ) && echo "" || echo RESTORE_INCOMPLETE`
+  },
+  {
+    name: "relayer CCTP_INBOUND_AFTER_USER_BURN is not a placeholder",
+    cmd: `grep -q "runPostUserBurnCctpInbound" apps/relayer/src/worker.ts && echo "" || echo RELAYER_PLACEHOLDER`
+  },
+  {
+    name: "frontend does NOT use local id as privy_user_id",
+    cmd: `grep -rn 'privyUserId = .*\\.id ?? "me"\\|privyUserId = .*as { id' apps/web/src/app/vault/page.tsx || true`
+  },
+  {
+    name: "verify-backup requires a verification body (schema)",
+    cmd: `grep -q "verifyBackupSchema.parse" apps/api/src/routes.ts && echo "" || echo VERIFY_NO_SCHEMA`
+  },
+  {
+    // FIX10/FIX11: blockers.md must not BOTH claim Phase-2 DONE and list the same
+    // work as remaining/in-progress. We allow the historical "P0 FIXES APPLIED"
+    // heading but forbid a bare "PRODUCT wallet architecture ... — DONE".
+    name: "docs: no Phase-2 DONE/remaining contradiction",
+    cmd: `grep -n "wallet architecture.*— DONE\\b" docs/blockers.md || true`
   }
 ];
+
+// Sentinels that, if present in output, mean the REQUIRED condition is missing.
+const FAILURE_SENTINELS = ["MISSING_GATE", "MISSING_SENDTX", "RESTORE_INCOMPLETE", "RELAYER_PLACEHOLDER", "VERIFY_NO_SCHEMA"];
 
 let failed = 0;
 for (const g of gates) {
   const lines = run(g.cmd).filter((l) => !(g.allow && g.allow.test(l)));
   if (g.name.includes("operator-driven deposit is gated")) {
-    // require the gate to be present
     const ok = lines.some((l) => l.includes("ENABLE_OPERATOR_TESTNET_DEPOSIT")) && !lines.includes("MISSING_GATE");
-    console.log(`${ok ? "PASS" : "FAIL"}  ${g.name}`);
-    if (!ok) failed++;
-    continue;
+    console.log(`${ok ? "PASS" : "FAIL"}  ${g.name}`); if (!ok) failed++; continue;
   }
-  const ok = lines.length === 0;
+  // "presence-required" gates emit a sentinel when the required code is absent.
+  const sentinelHit = lines.some((l) => FAILURE_SENTINELS.includes(l.trim()));
+  // "forbidden-pattern" gates fail when any (non-sentinel, non-empty) line remains.
+  const forbiddenHit = lines.some((l) => l.trim() && !FAILURE_SENTINELS.includes(l.trim()));
+  const ok = !sentinelHit && !forbiddenHit;
   console.log(`${ok ? "PASS" : "FAIL"}  ${g.name}${ok ? "" : "\n  " + lines.slice(0, 5).join("\n  ")}`);
   if (!ok) failed++;
 }
