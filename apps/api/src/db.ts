@@ -107,6 +107,36 @@ export class Store {
     );
   }
 
+  // ---- Privy identity (auth-privy adapter) ----
+
+  // Find or create the user for a Privy DID; bump last_login; ensure a profile.
+  async upsertUserByPrivyId(privyUserId: string, profile?: { email?: string; primaryAuthMethod?: string }): Promise<string> {
+    const existing = await this.pool.query<{ id: string }>("select id from users where privy_user_id=$1", [privyUserId]);
+    if (existing.rows[0]) {
+      await this.pool.query("update users set last_login_at=now(), updated_at=now() where id=$1", [existing.rows[0].id]);
+      return existing.rows[0].id;
+    }
+    const u = await this.pool.query<{ id: string }>(
+      "insert into users(privy_user_id, email, primary_auth_method, last_login_at) values ($1,$2,$3,now()) returning id",
+      [privyUserId, profile?.email ?? null, profile?.primaryAuthMethod ?? "privy"]
+    );
+    await this.pool.query("insert into user_profiles(user_id) values ($1) on conflict do nothing", [u.rows[0].id]);
+    return u.rows[0].id;
+  }
+
+  async userOwnsWallet(userId: string, address: string, chain?: string): Promise<boolean> {
+    const params: unknown[] = [userId, address];
+    let q = "select 1 from user_wallets where user_id=$1 and lower(address)=lower($2)";
+    if (chain) { params.push(chain); q += " and chain=$3"; }
+    const r = await this.pool.query(q, params);
+    return (r.rowCount ?? 0) > 0;
+  }
+
+  async userOwnsVault(userId: string, vaultId: string): Promise<boolean> {
+    const r = await this.pool.query("select 1 from note_vaults where user_id=$1 and vault_id=$2", [userId, vaultId]);
+    return (r.rowCount ?? 0) > 0;
+  }
+
   // ---- PHASE 2 auth / users ----
 
   async createNonce(walletType: string, address: string, nonce: string, message: string, expiresAt: Date): Promise<void> {

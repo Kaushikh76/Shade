@@ -20,6 +20,7 @@
     "circuits:build": "tsx scripts/circuits-build.ts",
     "circuits:test": "tsx scripts/circuits-test.ts",
     "proofs:test": "tsx apps/prover/src/proofs-test.ts",
+    "vault:test": "tsx packages/note-vault/src/vault-test.ts",
     "prover:test": "tsx apps/prover/src/prover-test.ts",
     "relayer:test": "tsx apps/relayer/src/relayer-test.ts",
     "api:test": "tsx apps/api/src/api-test.ts",

@@ -67,6 +67,31 @@ with real transactions (tx hashes in `docs/protocol-fixes.md`):
    the Arbitrum-side mint completes after Circle finalizes the attestation
    (minutes) — a normal CCTP lifecycle follow-up poll, not a blocker.
 
+## Phase-2 PRODUCT wallet architecture (per `audit.md`) — in progress
+
+The service/queue/API layer is done, but the audit found real product gaps. Honest
+status of the wallet rebuild (built in dependency order; see
+`docs/app-wallet-architecture.md`):
+
+- **Identity:** moving to **Privy-first** (`packages/auth-privy`, Privy DID =
+  canonical user). Custom wallet-nonce auth becomes dev-only behind
+  `ENABLE_LEGACY_WALLET_AUTH=false`.
+- **Note vault:** `packages/note-vault` — random `vault_master_key`, AES-256-GCM +
+  AAD, wrapped by passkey-PRF / Stellar-Ed25519 / recovery-kit (EVM diagnostic-only).
+  Backend stores only ciphertext + wrapped keys; rejects plaintext fields.
+- **Deposit:** must become **user-signed** (the user's EVM wallet signs approve +
+  `depositForBurnWithHook`); the backend must NOT use `ARB_SEPOLIA_PRIVATE_KEY` in
+  the user path. Relayer validates the user burn tx before mint/forward.
+- **Stellar spends:** must become **user-signed** via Freighter/Privy; remove
+  `STELLAR_USER_SECRET`/`toSecret` from app routes. Preferred future: proof-auth
+  `*_by_proof` entrypoints (no `require_auth`).
+- **Frontend:** `apps/web` (Next.js) with the full deposit→restore→spend flow.
+- **Recovery gate:** no deposit until vault backup verified + recovery policy
+  sufficient (≥1 non-EVM wrapper on testnet).
+
+Until these land, the existing operator-driven deposit and `STELLAR_USER_SECRET`
+withdraw paths remain DEV/TEST ONLY and must not be exposed as the app user path.
+
 ## Remaining real work (PHASE 2+)
 
 - Real `apps/api` live-action endpoints (currently several return 501): deposit

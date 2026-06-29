@@ -280,7 +280,20 @@ proof loop → RFQ → activity → logout) — PASS.
   incl. live audit.
 - `npm run services:test` aggregates prover + relayer + root-auditor — all PASS.
 
-PHASE 2 is COMPLETE. Tracked enhancements (not blockers): full RFQ on-chain
-lifecycle STATE (quote/intent registries) and true per-step CCTP_INBOUND
-decomposition — see `docs/blockers.md`. Next: PHASE 3 (Docker), PHASE 4 (Next.js),
-PHASE 6/7 (app + UI e2e). PHASE 5 (auth/user DB) is done as part of PHASE 2 above.
+The **service/queue/API layer** of PHASE 2 is COMPLETE. However, an audit
+(`audit.md`) defines the **product wallet architecture** as the real Phase-2
+deliverable, and that is an IN-PROGRESS rebuild — do not read "PHASE 2 complete" as
+covering it. Specifically still being built:
+- Privy-first identity (the custom wallet-nonce auth becomes dev-only behind
+  `ENABLE_LEGACY_WALLET_AUTH`); backend verifies Privy access tokens.
+- Browser **note vault** with a random master key + recovery wrappers (passkey
+  PRF / Stellar Ed25519 / recovery-kit; EVM diagnostic-only). `packages/note-vault`.
+- **User-signed** CCTP deposits (no backend EVM key in the user path) + relayer
+  validation of the user burn tx (`CCTP_INBOUND_AFTER_USER_BURN`).
+- **User-signed** Stellar spends (Freighter/Privy), removing `STELLAR_USER_SECRET`
+  from app routes.
+- Next.js `apps/web`, package cleanup (services off `apps/cli`), Docker, security
+  gates. See `docs/app-wallet-architecture.md` + `docs/blockers.md` for live status.
+
+Tracked enhancements (not blockers): full RFQ on-chain lifecycle STATE
+(quote/intent registries) and true per-step CCTP_INBOUND decomposition.

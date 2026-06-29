@@ -1,5 +1,10 @@
 import "dotenv/config";
 import { resolve } from "node:path";
+// This suite exercises the legacy wallet-signature auth flow; force it on and
+// ensure Privy is not auto-enabled in the test process.
+process.env.ENABLE_LEGACY_WALLET_AUTH = "true";
+delete process.env.PRIVY_APP_ID;
+delete process.env.PRIVY_JWT_VERIFICATION_KEY;
 import Fastify from "fastify";
 import { Wallet } from "ethers";
 import { Keypair } from "@stellar/stellar-sdk";

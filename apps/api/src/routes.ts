@@ -5,7 +5,14 @@ import { generateNotePreimage, poseidonCommitment } from "@shade/note-crypto";
 import { hashJson, deterministicId } from "@shade/shared-types/ids";
 import { intentSchema, quoteSchema } from "@shade/rfq-types";
 import { JobQueue } from "@shade/queue";
+import { requirePrivyUser, optionalPrivyUser } from "@shade/auth-privy";
 import { Store } from "./db.js";
+
+// Privy is the canonical identity by default. The legacy custom wallet-nonce auth
+// is dev-only behind ENABLE_LEGACY_WALLET_AUTH=true. Read at call time so tests and
+// runtime env changes take effect.
+const privyEnabled = () => !!process.env.PRIVY_APP_ID || !!process.env.PRIVY_JWT_VERIFICATION_KEY;
+const legacyWalletAuth = () => process.env.ENABLE_LEGACY_WALLET_AUTH === "true";
 import {
   authMessage, clearSessionCookie, newSessionToken, normalizeAddress,
   NONCE_TTL, optionalUser, readSessionToken, requireUser, SESSION_TTL, setSessionCookie,
@@ -97,7 +104,7 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   app.post("/v1/auth/stellar/verify", verifyHandler("STELLAR"));
 
   app.get("/v1/auth/session", async (request) => {
-    const userId = await optionalUser(store, request);
+    const userId = await authedUserOptional(store, request);
     return { authenticated: !!userId, user_id: userId };
   });
   app.post("/v1/auth/logout", async (request, reply) => {
@@ -109,21 +116,21 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
 
   // ---- User profile + wallets ----
   app.get("/v1/me", async (request) => {
-    const userId = await requireUser(store, request);
+    const userId = await authedUser(store, request);
     return store.getUser(userId);
   });
   app.patch("/v1/me", async (request) => {
-    const userId = await requireUser(store, request);
+    const userId = await authedUser(store, request);
     const body = updateMeSchema.parse(request.body);
     await store.updateUser(userId, body);
     return store.getUser(userId);
   });
   app.get("/v1/me/wallets", async (request) => {
-    const userId = await requireUser(store, request);
+    const userId = await authedUser(store, request);
     return { wallets: await store.listWallets(userId) };
   });
   app.post("/v1/me/wallets", async (request, reply) => {
-    const userId = await requireUser(store, request);
+    const userId = await authedUser(store, request);
     const body = addWalletSchema.parse(request.body);
     const address = normalizeAddress(body.wallet_type, body.address);
     const message = await store.consumeNonce(body.wallet_type, address, body.nonce);
@@ -133,19 +140,19 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
     return { wallet_id: walletId };
   });
   app.delete("/v1/me/wallets/:wallet_id", async (request, reply) => {
-    const userId = await requireUser(store, request);
+    const userId = await authedUser(store, request);
     const ok = await store.deleteWallet(userId, (request.params as { wallet_id: string }).wallet_id);
     if (!ok) { reply.code(409); return { error: "cannot delete (not found or primary)" }; }
     return { ok: true };
   });
 
   // ---- Per-user history ----
-  app.get("/v1/me/deposits", async (request) => ({ deposits: await store.listByUser("cctp_deposits", await requireUser(store, request)) }));
-  app.get("/v1/me/notes", async (request) => ({ notes: await store.listByUser("note_commitments", await requireUser(store, request)) }));
-  app.get("/v1/me/withdrawals", async (request) => ({ withdrawals: await store.listByUser("withdrawals", await requireUser(store, request)) }));
-  app.get("/v1/me/rfq", async (request) => ({ settlements: await store.listByUser("settlements", await requireUser(store, request)) }));
-  app.get("/v1/me/cctp-exits", async (request) => ({ exits: await store.listByUser("cctp_exits", await requireUser(store, request)) }));
-  app.get("/v1/me/note-backups", async (request) => ({ backups: await store.listByUser("encrypted_note_backups", await requireUser(store, request)) }));
+  app.get("/v1/me/deposits", async (request) => ({ deposits: await store.listByUser("cctp_deposits", await authedUser(store, request)) }));
+  app.get("/v1/me/notes", async (request) => ({ notes: await store.listByUser("note_commitments", await authedUser(store, request)) }));
+  app.get("/v1/me/withdrawals", async (request) => ({ withdrawals: await store.listByUser("withdrawals", await authedUser(store, request)) }));
+  app.get("/v1/me/rfq", async (request) => ({ settlements: await store.listByUser("settlements", await authedUser(store, request)) }));
+  app.get("/v1/me/cctp-exits", async (request) => ({ exits: await store.listByUser("cctp_exits", await authedUser(store, request)) }));
+  app.get("/v1/me/note-backups", async (request) => ({ backups: await store.listByUser("encrypted_note_backups", await authedUser(store, request)) }));
 
   app.post("/v1/deposits/prepare", async (request) => {
     const body = prepareDepositSchema.parse(request.body);
@@ -183,7 +190,7 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
       state: "prepared"
     });
     await store.transition({ entityType: "cctp_deposit", entityId: depositId, toState: "prepared" });
-    const userId = await optionalUser(store, request);
+    const userId = await authedUserOptional(store, request);
     if (userId) { await store.setRowUser("cctp_deposits", "deposit_id", depositId, userId); await store.logActivity(userId, { event_type: "deposit.prepare", entity_type: "deposit", entity_id: depositId }); }
     return { deposit_id: depositId, commitment, amount_usdc_7dp: amount7.toString() };
   });
@@ -212,7 +219,7 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   app.get("/v1/notes/:commitment/status", async (request) => store.getById("note_commitments", "commitment", (request.params as { commitment: string }).commitment));
   // Client-side-encrypted note backup (server never sees plaintext or note secrets).
   app.post("/v1/notes/encrypted-backup", async (request) => {
-    const userId = await requireUser(store, request);
+    const userId = await authedUser(store, request);
     const body = noteBackupSchema.parse(request.body);
     await store.addNoteBackup(userId, body.commitment, body.encrypted_payload, body.encryption_version);
     await store.logActivity(userId, { event_type: "note.backup", entity_type: "note", entity_id: body.commitment });
@@ -271,7 +278,7 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
       state: "INTENT_CREATED"
     });
     await store.transition({ entityType: "intent", entityId: intentHash, toState: "INTENT_CREATED" });
-    const userId = await optionalUser(store, request);
+    const userId = await authedUserOptional(store, request);
     if (userId) { await store.setRowUser("intents", "intent_hash", intentHash, userId); await store.logActivity(userId, { event_type: "intent.create", entity_type: "intent", entity_id: intentHash }); }
     return { intent_hash: intentHash };
   });
@@ -354,7 +361,7 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
     const settlementId = deterministicId({ namespace: "settle", parts: [body.intent_hash, body.quote_id, body.nullifier] });
     await store.insertGeneric("settlements", { settlement_id: settlementId, ...body, state: "SETTLEMENT_SUBMITTED" });
     await store.transition({ entityType: "settlement", entityId: settlementId, toState: "SETTLEMENT_SUBMITTED" });
-    const userId = await optionalUser(store, request);
+    const userId = await authedUserOptional(store, request);
     if (userId) { await store.setRowUser("settlements", "settlement_id", settlementId, userId); await store.logActivity(userId, { event_type: "rfq.settle", entity_type: "settlement", entity_id: settlementId }); }
     return { settlement_id: settlementId };
   });
@@ -367,7 +374,7 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
     const exitId = deterministicId({ namespace: "exit", parts: [idempotencyKey, body.nullifier] });
     await store.insertGeneric("cctp_exits", { exit_id: exitId, idempotency_key: idempotencyKey, ...body, state: "prepared" });
     await store.transition({ entityType: "cctp_exit", entityId: exitId, toState: "prepared" });
-    const userId = await optionalUser(store, request);
+    const userId = await authedUserOptional(store, request);
     if (userId) { await store.setRowUser("cctp_exits", "exit_id", exitId, userId); await store.logActivity(userId, { event_type: "cctp_exit.prepare", entity_type: "cctp_exit", entity_id: exitId }); }
     return { exit_id: exitId };
   });
@@ -393,12 +400,12 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
 
   // ---- Activity timeline + live stream ----
   app.get("/v1/activity", async (request) => {
-    const userId = await requireUser(store, request);
+    const userId = await authedUser(store, request);
     return { activity: await store.listActivity(userId) };
   });
   // Server-Sent Events stream of the authenticated user's activity (polls the DB).
   app.get("/v1/activity/stream", async (request, reply) => {
-    const userId = await requireUser(store, request);
+    const userId = await authedUser(store, request);
     reply.raw.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
     let lastSent = "";
     const send = async () => {
@@ -430,9 +437,22 @@ async function createWithdrawal(request: FastifyRequest, store: Store) {
     state: "prepared"
   });
   await store.transition({ entityType: "withdrawal", entityId: withdrawalId, toState: "prepared" });
-  const userId = await optionalUser(store, request);
+  const userId = await authedUserOptional(store, request);
   if (userId) { await store.setRowUser("withdrawals", "withdrawal_id", withdrawalId, userId); await store.logActivity(userId, { event_type: "withdrawal.prepare", entity_type: "withdrawal", entity_id: withdrawalId }); }
   return { withdrawal_id: withdrawalId };
+}
+
+// Unified auth: Privy by default; legacy session only when ENABLE_LEGACY_WALLET_AUTH.
+async function authedUser(store: Store, request: FastifyRequest): Promise<string> {
+  if (privyEnabled()) return (await requirePrivyUser(store, request)).userId;
+  if (legacyWalletAuth()) return requireUser(store, request);
+  const e = new Error("authentication not configured (set PRIVY_APP_ID or ENABLE_LEGACY_WALLET_AUTH)") as Error & { statusCode: number };
+  e.statusCode = 401; throw e;
+}
+async function authedUserOptional(store: Store, request: FastifyRequest): Promise<string | null> {
+  if (privyEnabled()) return (await optionalPrivyUser(store, request))?.userId ?? null;
+  if (legacyWalletAuth()) return optionalUser(store, request);
+  return null;
 }
 
 // C7: refuse spends while the root auditor (P1.9) has flagged a critical root

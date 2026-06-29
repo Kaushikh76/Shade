@@ -2,6 +2,16 @@
 
 Backend-only implementation workspace for Shade Protocol phase 1 through the MPC/TEE boundary.
 
+> **Phase-2 product status (per `audit.md`):** the protocol contracts/circuits
+> (Phase 1) and the queue-driven service layer + custom API are complete and
+> testnet-verified. The **product wallet architecture** — Privy-first identity,
+> browser note vault with recovery wrappers, user-signed CCTP deposits (no
+> backend-held user EVM key), user-signed Stellar spends (no `STELLAR_USER_SECRET`
+> in app routes), and the Next.js app — is an in-progress rebuild. See
+> `docs/app-wallet-architecture.md`, `docs/note-vault-recovery.md`,
+> `docs/privy-stellar-integration.md`, and `docs/blockers.md` for honest status.
+> The earlier custom wallet-nonce auth is dev-only behind `ENABLE_LEGACY_WALLET_AUTH`.
+
 ## What Is Built (working end-to-end on testnet, no mocks)
 
 All five core flows are implemented and verified with real testnet transactions
