@@ -17,10 +17,19 @@ export default function Dashboard() {
       try {
         setHealth(await ApiClient.health());
         const token = await getToken();
-        if (token) setVaults((await ApiClient.listVaults(token)).vaults);
+        if (!token) return;
+        // FIX2: sync the user's Privy linked EVM/Stellar wallets into the backend.
+        const toSync = wallets.map((w) => ({
+          wallet_type: w.address.startsWith("0x") ? "EVM" : "STELLAR",
+          wallet_source: w.walletClientType === "privy" ? "privy_embedded" : "external",
+          chain: w.address.startsWith("0x") ? "arbitrum-sepolia" : "stellar-testnet",
+          address: w.address, privy_wallet_id: w.address
+        }));
+        if (toSync.length) await ApiClient.syncPrivyWallets(token, toSync);
+        setVaults((await ApiClient.listVaults(token)).vaults);
       } catch (e) { setErr((e as Error).message); }
     })();
-  }, [getToken, authenticated]);
+  }, [getToken, authenticated, wallets]);
 
   if (!authenticated) return <p>Please log in.</p>;
   return (

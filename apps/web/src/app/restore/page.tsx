@@ -1,10 +1,10 @@
 "use client";
 import { useState } from "react";
 import { usePrivy } from "@privy-io/react-auth";
-import { parseVaultEnvelope, decryptEnvelope, unwrapVaultKeyWithStellarSignature, unwrapVaultKeyWithRecoveryKitPassword, type EncryptedVaultEnvelope } from "@shade/note-vault";
+import { validateVaultEnvelope, decryptEnvelope, unwrapVaultKeyWithStellarSignature, unwrapVaultKeyWithRecoveryKitPassword, type EncryptedVaultEnvelope } from "@shade/note-vault";
 import { ApiClient } from "@/lib/api";
 import { useAccessToken } from "@/lib/use-token";
-import { clearLocalCache, setMemoryVault } from "@/lib/vault-store";
+import { clearLocalCache, setMemoryVault, cacheEnvelope } from "@/lib/vault-store";
 import { connectFreighter, stellarRecoverySignature } from "@/lib/stellar-signer";
 
 // Restore flow: simulate a cache clear, fetch the encrypted envelope from the
@@ -24,7 +24,9 @@ export default function RestorePage() {
       if (!token) throw new Error("log in first");
       await clearLocalCache();
       say("Simulated cache clear (IndexedDB + memory cleared).");
-      const env = parseVaultEnvelope(JSON.stringify(await ApiClient.getVault(token, vaultId) as { envelope: EncryptedVaultEnvelope })["envelope"]);
+      const res = await ApiClient.getVault(token, vaultId) as { envelope: EncryptedVaultEnvelope };
+      const env = res.envelope;
+      validateVaultEnvelope(env); // shape + plaintext gate
       say("Fetched encrypted vault envelope from backend.");
 
       let master: Uint8Array;
@@ -43,8 +45,11 @@ export default function RestorePage() {
         say("Unlocked master key via recovery-kit passphrase.");
       }
       const vault = await decryptEnvelope(env, master);
+      // verify the decrypted vault matches the envelope's identity before trusting it
+      if (vault.vault_id !== env.vault_id) throw new Error("decrypted vault_id mismatch");
       setMemoryVault(vault);
-      say(`Decrypted vault — ${vault.notes.length} note(s) restored to memory.`);
+      await cacheEnvelope(env); // re-cache ENCRYPTED envelope only (no plaintext)
+      say(`Decrypted vault — ${vault.notes.length} note(s) restored to memory (encrypted-only cache).`);
       vault.notes.forEach((n) => say(`  note ${n.commitment.slice(0, 18)}… (${n.status})`));
       await ApiClient.markRestored(token, vaultId);
       say("Marked restored ✓. Notes are available without any plaintext leaving the browser.");
