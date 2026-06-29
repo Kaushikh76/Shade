@@ -65,7 +65,7 @@ export type NoteVault = {
   updated_at: string;
   notes: VaultNote[];
 };
-export type WrapperType = "passkey_prf" | "stellar_ed25519_signature" | "recovery_kit_password" | "evm_signature";
+export type WrapperType = "passkey_prf" | "stellar_ed25519_signature" | "recovery_file_secret" | "recovery_kit_password" | "evm_signature";
 export type VaultWrapper = {
   id: string;
   type: WrapperType;
@@ -91,15 +91,24 @@ export type EncryptedVaultEnvelope = {
 async function aesKey(raw: Uint8Array): Promise<CryptoKey> {
   return subtle.importKey("raw", bs(raw)!, { name: "AES-GCM" }, false, ["encrypt", "decrypt"]);
 }
+// PART1 fix: build the AES-GCM params and ONLY include `additionalData` when an AAD
+// is actually provided. Passing `additionalData: undefined` makes some browsers'
+// SubtleCrypto throw "AeadParams: additionalData: Not a BufferSource", which crashed
+// vault creation (the no-AAD wrapper encryption path).
+function aesGcmParams(iv: Uint8Array, aad?: Uint8Array): AesGcmParams {
+  const params: AesGcmParams = { name: "AES-GCM", iv: iv as unknown as BufferSource, tagLength: 128 };
+  if (aad !== undefined) params.additionalData = aad as unknown as BufferSource;
+  return params;
+}
 async function aesGcmEncrypt(rawKey: Uint8Array, plaintext: Uint8Array, aad?: Uint8Array): Promise<{ iv: Uint8Array; ct: Uint8Array }> {
   const iv = randomBytes(12);
   const key = await aesKey(rawKey);
-  const ct = new Uint8Array(await subtle.encrypt({ name: "AES-GCM", iv: bs(iv)!, additionalData: bs(aad), tagLength: 128 }, key, bs(plaintext)!));
+  const ct = new Uint8Array(await subtle.encrypt(aesGcmParams(iv, aad), key, bs(plaintext)!));
   return { iv, ct };
 }
 async function aesGcmDecrypt(rawKey: Uint8Array, iv: Uint8Array, ct: Uint8Array, aad?: Uint8Array): Promise<Uint8Array> {
   const key = await aesKey(rawKey);
-  return new Uint8Array(await subtle.decrypt({ name: "AES-GCM", iv: bs(iv)!, additionalData: bs(aad), tagLength: 128 }, key, bs(ct)!));
+  return new Uint8Array(await subtle.decrypt(aesGcmParams(iv, aad), key, bs(ct)!));
 }
 async function hkdf(ikm: Uint8Array, salt: Uint8Array, info: string): Promise<Uint8Array> {
   const base = await subtle.importKey("raw", bs(ikm)!, "HKDF", false, ["deriveBits"]);
@@ -250,6 +259,39 @@ export async function wrapVaultKeyWithRecoveryKitPassword(masterKey: VaultMaster
 export async function unwrapVaultKeyWithRecoveryKitPassword(wrapper: VaultWrapper, password: string): Promise<VaultMasterKey> {
   const wk = await pbkdf2(password, fromB64(wrapper.salt), PBKDF2_ITERS);
   return unwrapWithKey(wk, wrapper.wrapped_key);
+}
+
+// Emergency recovery file (PART5): a high-entropy secret generated in the browser
+// wraps the master key via HKDF. The secret is written into the DOWNLOADED file
+// only — never the backend. To restore, the user supplies the file (which carries
+// both the secret and the wrapped key); the backend stores only the wrapped key.
+export type RecoveryFile = {
+  version: "shade-recovery-file-v1";
+  vault_id: string;
+  created_at: string;
+  app: "Shade Protocol";
+  warning: string;
+  recovery_file_secret: string; // base64 — lives ONLY in this file, never on the backend
+  wrapper: VaultWrapper;        // the same wrapper stored in the envelope (no secret)
+};
+export function generateRecoveryFileSecret(): Uint8Array {
+  return randomBytes(32);
+}
+export async function wrapVaultKeyWithRecoveryFileSecret(masterKey: VaultMasterKey, secret: Uint8Array, metadata: Record<string, unknown>): Promise<VaultWrapper> {
+  const salt = randomBytes(16);
+  const wk = await hkdf(secret, salt, "shade-vault-recovery-file");
+  return { id: toHex(randomBytes(8)), type: "recovery_file_secret", status: "active", kdf: "HKDF-SHA256", salt: toB64(salt), wrapped_key: await wrapWithKey(wk, masterKey), metadata };
+}
+export async function unwrapVaultKeyWithRecoveryFileSecret(wrapper: VaultWrapper, secret: Uint8Array): Promise<VaultMasterKey> {
+  const wk = await hkdf(secret, fromB64(wrapper.salt), "shade-vault-recovery-file");
+  return unwrapWithKey(wk, wrapper.wrapped_key);
+}
+export function buildRecoveryFile(vaultId: string, secret: Uint8Array, wrapper: VaultWrapper, now: string): RecoveryFile {
+  return {
+    version: "shade-recovery-file-v1", vault_id: vaultId, created_at: now, app: "Shade Protocol",
+    warning: "Keep this file safe. It can help restore your private vault. Anyone with this file can decrypt your vault.",
+    recovery_file_secret: toB64(secret), wrapper
+  };
 }
 
 // EVM signature wrapper — DIAGNOSTIC ONLY. Marked diagnostic_only:true; cannot

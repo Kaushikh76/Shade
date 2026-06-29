@@ -1,72 +1,120 @@
 "use client";
 import { useState } from "react";
 import { usePrivy } from "@privy-io/react-auth";
-import { validateVaultEnvelope, decryptEnvelope, unwrapVaultKeyWithStellarSignature, unwrapVaultKeyWithRecoveryKitPassword, type EncryptedVaultEnvelope } from "@shade/note-vault";
+import {
+  validateVaultEnvelope, decryptEnvelope, unwrapVaultKeyWithStellarSignature,
+  unwrapVaultKeyWithRecoveryFileSecret, unwrapVaultKeyWithRecoveryKitPassword,
+  fromB64, type EncryptedVaultEnvelope, type RecoveryFile
+} from "@shade/note-vault";
 import { ApiClient } from "@/lib/api";
 import { useAccessToken } from "@/lib/use-token";
 import { clearLocalCache, setMemoryVault, cacheEnvelope } from "@/lib/vault-store";
 import { connectFreighter, stellarRecoverySignature } from "@/lib/stellar-signer";
 
-// Restore flow: simulate a cache clear, fetch the encrypted envelope from the
-// backend, unlock the master key with a recovery wrapper, decrypt, and verify the
-// note commitments match — proving notes survive a browser wipe.
+type Method = "freighter" | "file" | "password";
+
+// PART11: restore with passkey/Freighter/recovery-file/advanced-password. The
+// recovery file path needs no typing — the user just picks their downloaded file.
 export default function RestorePage() {
   const { authenticated } = usePrivy();
   const getToken = useAccessToken();
-  const [vaultId, setVaultId] = useState("");
   const [log, setLog] = useState<string[]>([]);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const say = (m: string) => setLog((l) => [...l, m]);
 
-  async function restore(method: "stellar" | "kit") {
+  async function fetchEnvelope(token: string, vaultId: string): Promise<EncryptedVaultEnvelope> {
+    const res = await ApiClient.getVault(token, vaultId) as { envelope: EncryptedVaultEnvelope };
+    const env = res.envelope;
+    validateVaultEnvelope(env);
+    return env;
+  }
+
+  async function finish(token: string, env: EncryptedVaultEnvelope, master: Uint8Array) {
+    const vault = await decryptEnvelope(env, master);
+    if (vault.vault_id !== env.vault_id) throw new Error("restored vault id mismatch");
+    setMemoryVault(vault);
+    await cacheEnvelope(env);
+    say(`Vault restored — ${vault.notes.length} private receipt(s) recovered.`);
+    vault.notes.forEach((n) => say(`  receipt ${n.commitment.slice(0, 18)}… (${n.status})`));
+    await ApiClient.markRestored(token, env.vault_id);
+    say("Vault restored successfully. No plaintext ever left your browser.");
+  }
+
+  // Restore from the downloaded recovery file (passwordless).
+  async function restoreFromFile(file: File) {
     setLog([]);
     try {
-      const token = await getToken();
-      if (!token) throw new Error("log in first");
+      const token = await getToken(); if (!token) throw new Error("log in first");
+      const rf = JSON.parse(await file.text()) as RecoveryFile;
+      if (rf.version !== "shade-recovery-file-v1") throw new Error("not a Shade recovery file");
       await clearLocalCache();
-      say("Simulated cache clear (IndexedDB + memory cleared).");
-      const res = await ApiClient.getVault(token, vaultId) as { envelope: EncryptedVaultEnvelope };
-      const env = res.envelope;
-      validateVaultEnvelope(env); // shape + plaintext gate
-      say("Fetched encrypted vault envelope from backend.");
-
-      let master: Uint8Array;
-      if (method === "stellar") {
-        const addr = await connectFreighter();
-        const sig = await stellarRecoverySignature(addr);
-        const w = env.wrappers.find((x) => x.type === "stellar_ed25519_signature");
-        if (!w) throw new Error("no Stellar wrapper on this vault");
-        master = await unwrapVaultKeyWithStellarSignature(w, sig);
-        say("Unlocked master key via Stellar Ed25519 wrapper.");
-      } else {
-        const pw = prompt("Recovery-kit passphrase:") ?? "";
-        const w = env.wrappers.find((x) => x.type === "recovery_kit_password");
-        if (!w) throw new Error("no recovery-kit wrapper on this vault");
-        master = await unwrapVaultKeyWithRecoveryKitPassword(w, pw);
-        say("Unlocked master key via recovery-kit passphrase.");
-      }
-      const vault = await decryptEnvelope(env, master);
-      // verify the decrypted vault matches the envelope's identity before trusting it
-      if (vault.vault_id !== env.vault_id) throw new Error("decrypted vault_id mismatch");
-      setMemoryVault(vault);
-      await cacheEnvelope(env); // re-cache ENCRYPTED envelope only (no plaintext)
-      say(`Decrypted vault — ${vault.notes.length} note(s) restored to memory (encrypted-only cache).`);
-      vault.notes.forEach((n) => say(`  note ${n.commitment.slice(0, 18)}… (${n.status})`));
-      await ApiClient.markRestored(token, vaultId);
-      say("Marked restored ✓. Notes are available without any plaintext leaving the browser.");
+      say("Cleared local cache (simulating a fresh device).");
+      const env = await fetchEnvelope(token, rf.vault_id);
+      const w = env.wrappers.find((x) => x.type === "recovery_file_secret");
+      if (!w) throw new Error("this vault has no recovery-file method");
+      const master = await unwrapVaultKeyWithRecoveryFileSecret(w, fromB64(rf.recovery_file_secret));
+      await finish(token, env, master);
     } catch (e) { say(`Error: ${(e as Error).message}`); }
   }
 
-  if (!authenticated) return <p>Please log in.</p>;
+  async function restoreWith(method: Exclude<Method, "file">, vaultId: string) {
+    setLog([]);
+    try {
+      const token = await getToken(); if (!token) throw new Error("log in first");
+      if (!vaultId) throw new Error("enter your vault id (or use the recovery file)");
+      await clearLocalCache();
+      say("Cleared local cache (simulating a fresh device).");
+      const env = await fetchEnvelope(token, vaultId);
+      let master: Uint8Array;
+      if (method === "freighter") {
+        const addr = await connectFreighter();
+        const sig = await stellarRecoverySignature(addr);
+        const w = env.wrappers.find((x) => x.type === "stellar_ed25519_signature");
+        if (!w) throw new Error("this vault has no Stellar wallet method");
+        master = await unwrapVaultKeyWithStellarSignature(w, sig);
+      } else {
+        const pw = prompt("Recovery passphrase:") ?? "";
+        const w = env.wrappers.find((x) => x.type === "recovery_kit_password");
+        if (!w) throw new Error("this vault has no password method");
+        master = await unwrapVaultKeyWithRecoveryKitPassword(w, pw);
+      }
+      await finish(token, env, master);
+    } catch (e) { say(`Error: ${(e as Error).message}`); }
+  }
+
+  const [vaultId, setVaultId] = useState("");
+  if (!authenticated) return <p className="text-neutral-300">Please log in to restore your vault.</p>;
+
   return (
-    <div className="space-y-4">
-      <h1 className="text-2xl font-bold">Restore Vault</h1>
-      <p className="text-sm text-neutral-400">Recover your private notes after a cache wipe using a recovery wrapper. The backend only ever held ciphertext.</p>
-      <label className="block text-sm">Vault id<input value={vaultId} onChange={(e) => setVaultId(e.target.value)} placeholder="vault-…" className="ml-2 w-96 rounded bg-neutral-800 px-2 py-1" /></label>
-      <div className="flex gap-3">
-        <button onClick={() => restore("stellar")} className="rounded bg-violet-600 px-4 py-2">Restore via Stellar</button>
-        <button onClick={() => restore("kit")} className="rounded bg-neutral-700 px-4 py-2">Restore via recovery kit</button>
+    <div className="space-y-5">
+      <div>
+        <h1 className="text-2xl font-bold">Restore your vault</h1>
+        <p className="text-sm text-neutral-400">Recover your private receipts on a new device. The backend only ever held encrypted data.</p>
       </div>
-      <pre className="overflow-auto rounded bg-neutral-900 p-3 text-xs">{log.join("\n")}</pre>
+
+      <div className="rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+        <h3 className="font-medium">Restore from recovery file</h3>
+        <p className="text-xs text-neutral-400">Pick the emergency recovery file you downloaded when you created the vault. No password needed.</p>
+        <input type="file" accept="application/json" onChange={(e) => e.target.files?.[0] && restoreFromFile(e.target.files[0])} className="mt-2 text-sm" />
+      </div>
+
+      <div className="rounded-lg border border-neutral-800 bg-neutral-900 p-4 space-y-2">
+        <h3 className="font-medium">Restore with your Stellar wallet</h3>
+        <p className="text-xs text-neutral-400">Use Freighter to sign and unlock your vault.</p>
+        <input value={vaultId} onChange={(e) => setVaultId(e.target.value)} placeholder="vault id" className="w-80 rounded bg-neutral-800 px-2 py-1 text-sm" />
+        <button onClick={() => restoreWith("freighter", vaultId)} className="ml-2 rounded bg-violet-600 px-3 py-1 text-sm">Restore with Freighter</button>
+      </div>
+
+      <div>
+        <button onClick={() => setShowAdvanced((v) => !v)} className="text-xs text-neutral-500 underline">Advanced: password recovery</button>
+        {showAdvanced && (
+          <div className="mt-2 rounded-lg border border-neutral-800 bg-neutral-900 p-4">
+            <button onClick={() => restoreWith("password", vaultId)} className="rounded bg-neutral-800 px-3 py-1 text-sm">Restore with password</button>
+          </div>
+        )}
+      </div>
+
+      <pre className="overflow-auto rounded bg-neutral-900 p-3 text-xs text-neutral-400">{log.join("\n")}</pre>
     </div>
   );
 }

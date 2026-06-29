@@ -1,0 +1,46 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
+
+// FIX12 frontend-flow test: static assertions that the web flow is real (not a
+// stub). The full live browser e2e is Playwright (P1, NOT RUN here); this guards
+// the source against regressing to the audited-failed states.
+
+const ROOT = process.env.SHADE_ROOT ?? process.cwd();
+const read = (p: string) => readFileSync(resolve(ROOT, p), "utf8");
+const results: { name: string; ok: boolean }[] = [];
+const check = (name: string, ok: boolean) => { results.push({ name, ok }); console.log(`${ok ? "PASS" : "FAIL"}  ${name}`); };
+
+const deposit = read("apps/web/src/app/deposit/page.tsx");
+const restore = read("apps/web/src/app/restore/page.tsx");
+const vault = read("apps/web/src/app/vault/page.tsx");
+
+// Deposit
+// real prompt() calls only — ignore lines that are // comments
+check("deposit: no prompt() burn-hash entry", !deposit.split("\n").some((l) => /\bprompt\(/.test(l) && !l.trim().startsWith("//")));
+check("deposit: sends approve (encodeFunctionData approve)", /functionName:\s*"approve"/.test(deposit));
+check("deposit: sends CCTP burn (depositForBurnWithHook)", /depositForBurnWithHook/.test(deposit) && /sendTransaction/.test(deposit));
+check("deposit: checks allowance before approve", /functionName:\s*"allowance"/.test(deposit));
+check("deposit: auto-submits burn hash to backend", /burnSubmitted\(/.test(deposit) && /burn_tx_hash:\s*burnHash/.test(deposit));
+check("deposit: checkout-style progress (not raw stage names primary)", /Approve USDC/.test(deposit) && /Move USDC privately/.test(deposit));
+// PART6: deposit must auto-select a verified vault, not ask the user to type one.
+check("deposit: auto-selects verified vault (no manual id input)", /listVaults\(/.test(deposit) && !/placeholder="vault-/.test(deposit));
+check("deposit: shows create-vault CTA when none", /Go to Vault Setup/.test(deposit) && /status: "none"/.test(deposit));
+
+// Restore
+check("restore: fetches envelope via getVault", /getVault\(/.test(restore));
+check("restore: decrypts the envelope", /decryptEnvelope\(/.test(restore));
+check("restore: does NOT index a string for envelope", !/JSON\.stringify\(await ApiClient\.getVault/.test(restore));
+check("restore: clears cache + sets memory vault", /clearLocalCache\(/.test(restore) && /setMemoryVault\(/.test(restore));
+check("restore: offers recovery-file restore (passwordless)", /restoreFromFile\(/.test(restore) && /recovery_file_secret/.test(restore));
+
+// Vault
+check("vault: uses Privy DID (privy_user_id), not local id", /privy_user_id/.test(vault) && !/\.id \?\? "me"/.test(vault));
+check("vault: proves restore before verify-backup", /decryptEnvelope\(/.test(vault) && /verifyBackup\(/.test(vault));
+// PART2: default vault creation must NOT ask for a password first.
+check("vault: not password-first (no prompt before Advanced)", !vault.split("\n").slice(0, vault.split("\n").findIndex((l) => /addPasswordRecovery/.test(l)) || vault.split("\n").length).some((l) => /\bprompt\(/.test(l) && !l.trim().startsWith("//")));
+check("vault: first action is Create Private Vault", /Create Private Vault/.test(vault));
+check("vault: downloads emergency recovery file by default", /buildRecoveryFile\(/.test(vault) && /wrapVaultKeyWithRecoveryFileSecret\(/.test(vault));
+
+const failed = results.filter((r) => !r.ok);
+if (failed.length) { console.error(`\nFRONTEND-FLOW TESTS FAILED: ${failed.map((f) => f.name).join(", ")}`); process.exit(1); }
+console.log("\nFRONTEND-FLOW TESTS PASS");

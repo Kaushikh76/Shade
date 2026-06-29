@@ -67,7 +67,46 @@ with real transactions (tx hashes in `docs/protocol-fixes.md`):
    the Arbitrum-side mint completes after Circle finalizes the attestation
    (minutes) — a normal CCTP lifecycle follow-up poll, not a blocker.
 
-## Phase-2 PRODUCT wallet architecture (per `audit.md`) — DONE
+## Phase-2 PRODUCT wallet architecture (per `audit.md` + `audit2.md` + `audit3.md`) — P0 FIXES APPLIED
+
+### audit3 (vault UX + WebCrypto fix)
+- **Critical bug fixed:** vault creation crashed with `AeadParams: additionalData:
+  Not a BufferSource` because AES-GCM was always given `additionalData` (= undefined
+  on the no-AAD wrapper path). `aesGcmParams()` now omits it when no AAD is given.
+- **Passwordless UX:** vault setup is passkey/wallet-first and downloads an
+  emergency recovery file by default (new `recovery_file_secret` wrapper); password
+  recovery is hidden under Advanced. Deposit auto-selects a verified vault (no typing
+  a vault id) and shows checkout-style steps; restore offers file/Freighter/password.
+- **Finality:** user-burn validation now enforces the CCTP `minFinalityThreshold`.
+- **Honesty:** the relayer stops at `burn_validated` / `awaiting_proof_witness` when
+  no coin witness is supplied and only marks a deposit `active` after a real
+  `receiveDepositTxHash`. The deposit UI surfaces this honestly.
+- **Repo hygiene (PART10) intentionally skipped:** the `frontend/` folder (including
+  `frontend/.next`) is left untouched per the repo owner's instruction; the audit3
+  request to `git rm` those artifacts was not performed.
+
+
+An acceptance audit (`audit2.md`) found 12 P0 gaps in the first wallet pass; all are
+now fixed and gated by `npm run phase2:acceptance` (typecheck + vault + auth-privy +
+vault-api + deposit-api + route-auth + frontend-flow + relayer-user-burn + security
+gates — all PASS offline). What changed since the first pass:
+- Vault now uses the real **Privy DID** (`/v1/me.privy_user_id`), not the local UUID.
+- **Backup verification is real**: the client fetches the envelope back, unwraps,
+  decrypts, compares vault_id + commitments, and only then calls verify-backup with
+  a non-empty proof-of-decrypt object (backend rejects empty/insufficient-policy).
+- **Restore page** fixed (was indexing a string) — real fetch → unwrap → decrypt →
+  compare.
+- **Deposit** signs approve + `depositForBurnWithHook` with the user's wallet via
+  viem (allowance-checked), auto-submits the burn hash (no `prompt()`).
+- **Relayer `CCTP_INBOUND_AFTER_USER_BURN`** completes the Stellar side
+  (validate burn → attestation → mint_and_forward → DepositNoteMint proof →
+  receive_cctp_deposit), no placeholder.
+- **All user-owned state-changing routes require Privy auth + ownership** (27/27
+  route-auth checks pass); **Privy wallet sync** (`/v1/me/wallets/sync-privy`) added.
+- **RFQ** intent stores user_id; quote-accept checks intent ownership + immutability.
+- **Dev/legacy routes** gated behind `ENABLE_DEV_ROUTES`.
+
+### Status of the original wallet rebuild (still true)
 
 The wallet rebuild is implemented and tested (see `docs/app-wallet-architecture.md`,
 `docs/note-vault-recovery.md`, `docs/privy-stellar-integration.md`):

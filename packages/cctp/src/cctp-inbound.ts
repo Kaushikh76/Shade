@@ -256,7 +256,7 @@ export type BurnValidation = {
 // Validate a user-submitted depositForBurnWithHook tx against the expected deposit
 // terms. Throws on ANY mismatch. Returns the decoded burn params on success.
 export async function validateInboundBurnTx(env: EnvMap, args: {
-  burnTxHash: string; expectedSender: string; expectedAmount6: bigint; pool: string; expectedMaxFee6?: bigint;
+  burnTxHash: string; expectedSender: string; expectedAmount6: bigint; pool: string; expectedMaxFee6?: bigint; expectedFinality?: number;
 }): Promise<BurnValidation> {
   const provider = new JsonRpcProvider(env.ARB_SEPOLIA_RPC_URL ?? "https://sepolia-rollup.arbitrum.io/rpc");
   const tx = await provider.getTransaction(args.burnTxHash);
@@ -283,6 +283,10 @@ export async function validateInboundBurnTx(env: EnvMap, args: {
   if (String(d.args[3]).toLowerCase() !== usdc) throw new Error("burn burnToken != expected USDC");
   if (String(d.args[4]).toLowerCase() !== expMint) throw new Error("burn destinationCaller != Stellar CCTP Forwarder");
   if (args.expectedMaxFee6 !== undefined && BigInt(d.args[5]) > args.expectedMaxFee6) throw new Error("burn maxFee exceeds prepared maxFee");
+  // PART8: explicitly enforce the CCTP finality threshold (must match the value the
+  // /v1/deposits/prepare burn request used; defaults to CONFIRMED for fast transfer).
+  const expectedFinality = args.expectedFinality ?? (env.EXPECTED_CCTP_FINALITY_THRESHOLD ? Number(env.EXPECTED_CCTP_FINALITY_THRESHOLD) : FINALITY_THRESHOLD_CONFIRMED);
+  if (Number(d.args[6]) !== expectedFinality) throw new Error(`burn minFinalityThreshold ${Number(d.args[6])} != expected ${expectedFinality}`);
   if (String(d.args[7]).toLowerCase() !== expHook) throw new Error("burn hookData forwardRecipient != ShadePool");
   return {
     burnTxHash: args.burnTxHash, sender: tx.from, amount6: BigInt(d.args[0]), destinationDomain: Number(d.args[1]),

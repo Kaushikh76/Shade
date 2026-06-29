@@ -4,6 +4,7 @@ import {
   wrapVaultKeyWithStellarSignature, unwrapVaultKeyWithStellarSignature,
   wrapVaultKeyWithRecoveryKitPassword, unwrapVaultKeyWithRecoveryKitPassword,
   wrapVaultKeyWithPasskeyPrf, unwrapVaultKeyWithPasskeyPrf,
+  generateRecoveryFileSecret, wrapVaultKeyWithRecoveryFileSecret, unwrapVaultKeyWithRecoveryFileSecret, buildRecoveryFile,
   diagnosticWrapVaultKeyWithEvmSignature, diagnosticVerifyEvmSignatureStability,
   evaluateRecoveryPolicy, randomBytes, toHex, type VaultNote, type EncryptedVaultEnvelope
 } from "./index.js";
@@ -83,6 +84,30 @@ async function buildVaultEnvelope() {
     const prfWrapper = await wrapVaultKeyWithPasskeyPrf(masterPrf, prfOut, { credential_id_hash: "h", backup_eligible: true, backup_state: true });
     const prfBack = await unwrapVaultKeyWithPasskeyPrf(prfWrapper, prfOut);
     check("passkey PRF wrapper roundtrip (mocked)", eq(prfBack, masterPrf) && prfWrapper.type === "passkey_prf");
+
+    // PART1: each wrapper encrypts the master key with NO AAD — this is the path
+    // that crashed with "additionalData: Not a BufferSource". All must roundtrip.
+    const mNoAad = generateVaultMasterKey();
+    const stW = await wrapVaultKeyWithStellarSignature(mNoAad, stellarSig, {});
+    check("PART1: Stellar wrapper encrypt/decrypt with NO AAD", eq(await unwrapVaultKeyWithStellarSignature(stW, stellarSig), mNoAad));
+    const kitW = await wrapVaultKeyWithRecoveryKitPassword(mNoAad, "pw", {});
+    check("PART1: recovery-kit wrapper encrypt/decrypt with NO AAD", eq(await unwrapVaultKeyWithRecoveryKitPassword(kitW, "pw"), mNoAad));
+    const evmW = await diagnosticWrapVaultKeyWithEvmSignature(mNoAad, randomBytes(65), {});
+    check("PART1: EVM diagnostic wrapper encrypt/decrypt with NO AAD", evmW.type === "evm_signature");
+
+    // PART5: emergency recovery-file wrapper (passwordless)
+    const masterRf = generateVaultMasterKey();
+    const secret = generateRecoveryFileSecret();
+    const rfWrapper = await wrapVaultKeyWithRecoveryFileSecret(masterRf, secret, { device_hint: "browser" });
+    const rfBack = await unwrapVaultKeyWithRecoveryFileSecret(rfWrapper, secret);
+    const rfWrong = await unwrapVaultKeyWithRecoveryFileSecret(rfWrapper, randomBytes(32)).then(() => false).catch(() => true);
+    check("recovery-file wrapper wrap/unwrap + wrong secret fails", eq(rfBack, masterRf) && rfWrong && rfWrapper.type === "recovery_file_secret");
+    const rf = buildRecoveryFile("vault-rf", secret, rfWrapper, NOW);
+    check("recovery file carries secret + wrapper (no plaintext master key)", rf.recovery_file_secret.length > 0 && !("vault_master_key" in (rf as Record<string, unknown>)) && rf.wrapper.type === "recovery_file_secret");
+    // recovery file alone is sufficient on testnet (min 1, non-EVM)
+    check("recovery file alone sufficient (testnet min 1)", evaluateRecoveryPolicy([rfWrapper], { mainnet: false, min: 1, allowEvmOnly: false }) === "sufficient");
+    // recovery file + passkey is strong in mainnet mode
+    check("recovery file + passkey is strong (mainnet)", evaluateRecoveryPolicy([rfWrapper, prfWrapper], { mainnet: true, min: 2, allowEvmOnly: false }) === "strong");
 
     // EVM wrapper is diagnostic-only
     const evmWrapper = await diagnosticWrapVaultKeyWithEvmSignature(generateVaultMasterKey(), randomBytes(65), {});
