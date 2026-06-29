@@ -56,9 +56,17 @@ export default function DepositPage() {
       };
       say(`Prepared deposit ${prep.deposit_id}.`);
 
-      // 3) viem wallet client over the Privy provider
+      // 3) ensure the wallet is on Arbitrum Sepolia (CCTP burn chain) BEFORE signing,
+      //    then build the viem clients over the Privy provider.
+      if (typeof evm.switchChain === "function") {
+        try { await evm.switchChain(arbitrumSepolia.id); say(`Switched wallet to Arbitrum Sepolia (chain ${arbitrumSepolia.id}).`); }
+        catch (e) { throw new Error(`please switch your wallet to Arbitrum Sepolia (chain ${arbitrumSepolia.id}): ${(e as Error).message}`); }
+      }
       const provider = await evm.getEthereumProvider();
       const account = evm.address as Hex;
+      // confirm the provider is actually on the right chain
+      const chainHex = await provider.request({ method: "eth_chainId" }) as string;
+      if (parseInt(chainHex, 16) !== arbitrumSepolia.id) throw new Error(`wallet is on chain ${parseInt(chainHex, 16)}, expected Arbitrum Sepolia (${arbitrumSepolia.id})`);
       const walletClient = createWalletClient({ account, chain: arbitrumSepolia, transport: custom(provider) });
       const publicClient = createPublicClient({ chain: arbitrumSepolia, transport: custom(provider) });
 

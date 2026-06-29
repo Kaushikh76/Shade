@@ -39,7 +39,11 @@ export default function Dashboard() {
       <section><h2 className="font-semibold">User</h2><p className="text-sm text-neutral-400">{user?.id}</p></section>
       <section>
         <h2 className="font-semibold">Connected wallets</h2>
-        <ul className="text-sm text-neutral-400">{wallets.map((w) => <li key={w.address}>{w.walletClientType}: {w.address}</li>)}</ul>
+        <ul className="text-sm text-neutral-400">{wallets.map((w) => {
+          const id = Number((w.chainId ?? "").toString().replace("eip155:", "")) || 0;
+          const onArb = id === 421614;
+          return <li key={w.address}>{w.walletClientType}: {w.address} <span className={onArb ? "text-green-400" : "text-amber-400"}>· chain {id || "?"}{onArb ? " (Arbitrum Sepolia ✓)" : " (deposit needs 421614)"}</span></li>;
+        })}</ul>
       </section>
       <section>
         <h2 className="font-semibold">Note vaults ({vaults.length})</h2>
