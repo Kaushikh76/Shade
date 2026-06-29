@@ -11,7 +11,7 @@ import { Keypair } from "@stellar/stellar-sdk";
 import { registerRoutes } from "./routes.js";
 import { JobQueue } from "@shade/queue";
 import { generateNotePreimage, poseidonCommitment } from "@shade/note-crypto";
-import { generateCoin, buildAssociationSet } from "../../cli/src/lib/prove.js";
+import { generateCoin, buildAssociationSet } from "@shade/proving";
 import { runProverOnce } from "../../prover/src/worker.js";
 
 // PHASE 2 API behavior tests (beyond registration; Critical 14). Drives real

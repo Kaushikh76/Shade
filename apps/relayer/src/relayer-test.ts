@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { JobQueue } from "@shade/queue";
-import { generateCoin, buildAssociationSet, computeStateRoot } from "../../cli/src/lib/prove.js";
+import { generateCoin, buildAssociationSet, computeStateRoot } from "@shade/proving";
 import { sorobanInvoke } from "@shade/stellar-utils";
 import { runRelayerOnce } from "./worker.js";
 

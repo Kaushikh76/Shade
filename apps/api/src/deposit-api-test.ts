@@ -25,6 +25,7 @@ const check = (name: string, ok: boolean, detail = "") => { results.push({ name,
 const b64url = (b: Uint8Array) => { let s = ""; for (const x of b) s += String.fromCharCode(x); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
 const bs = (u: Uint8Array) => u as unknown as BufferSource;
 const json = (r: { json: () => unknown }) => r.json() as Record<string, unknown>;
+const toHexRun = (b: Uint8Array) => [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 
 let signKey: CryptoKey;
 async function tokenFor(did: string): Promise<string> {
@@ -81,17 +82,20 @@ async function makeVerifiedVault(app: ReturnType<typeof Fastify>, authH: Record<
     // prepare requires auth
     check("deposit prepare 401 without auth", (await app.inject({ method: "POST", url: "/v1/deposits/prepare", headers: { "idempotency-key": "k1234567" }, payload: {} })).statusCode === 401);
 
+    // Unique commitment + idempotency key per run so the deterministic deposit_id
+    // is fresh (avoids colliding with a prior run's row in the shared DB).
+    const runTag = toHexRun(randomBytes(16));
     const prepBody = {
       amount_usdc_6dp: "1000000", source_chain: "arbitrum-sepolia", source_wallet_address: signer.address,
-      vault_id: vaultId, commitment: "0x" + "ab".repeat(32), encrypted_note_payload_hash: "0x" + "cd".repeat(32), policy_id: "shade:default"
+      vault_id: vaultId, commitment: "0x" + runTag + "ab".repeat(16), encrypted_note_payload_hash: "0x" + "cd".repeat(32), policy_id: "shade:default"
     };
-    const prep = await app.inject({ method: "POST", url: "/v1/deposits/prepare", headers: { ...authH, "idempotency-key": "kdeposit12345" }, payload: prepBody });
+    const prep = await app.inject({ method: "POST", url: "/v1/deposits/prepare", headers: { ...authH, "idempotency-key": `kdep-${runTag}` }, payload: prepBody });
     const pj = json(prep);
     check("prepare returns approval + burn tx requests (no server EVM key)", prep.statusCode === 200 && !!pj.approval_tx_request && !!pj.burn_tx_request && !!pj.mint_recipient, `status=${prep.statusCode}`);
     check("burn tx targets CCTP TokenMessenger, dest=Stellar", !!pj.token_messenger_address && pj.destination_domain === 27);
 
     // prepare with unowned wallet rejected
-    const badWallet = await app.inject({ method: "POST", url: "/v1/deposits/prepare", headers: { ...authH, "idempotency-key": "kbadwallet123" }, payload: { ...prepBody, source_wallet_address: Wallet.createRandom().address } });
+    const badWallet = await app.inject({ method: "POST", url: "/v1/deposits/prepare", headers: { ...authH, "idempotency-key": `kbad-${runTag}` }, payload: { ...prepBody, source_wallet_address: Wallet.createRandom().address } });
     check("prepare rejects unowned wallet (403)", badWallet.statusCode === 403);
 
     // prepare with unverified vault rejected
@@ -104,7 +108,7 @@ async function makeVerifiedVault(app: ReturnType<typeof Fastify>, authH: Record<
     const w2 = await wrapVaultKeyWithStellarSignature(m2, randomBytes(64), {});
     const env2 = await createVaultEnvelope({ vault: v2, masterKey: m2, privyUserId: did, origin: ORIGIN, wrappers: [w2] });
     await app.inject({ method: "POST", url: "/v1/note-vaults", headers: authH, payload: { envelope: env2 } });
-    const unverifiedDep = await app.inject({ method: "POST", url: "/v1/deposits/prepare", headers: { ...authH, "idempotency-key": "kunverified12" }, payload: { ...prepBody, vault_id: unverifiedVaultId } });
+    const unverifiedDep = await app.inject({ method: "POST", url: "/v1/deposits/prepare", headers: { ...authH, "idempotency-key": `kunv-${runTag}` }, payload: { ...prepBody, vault_id: unverifiedVaultId } });
     check("prepare rejects unverified vault (409)", unverifiedDep.statusCode === 409);
 
     // burn-submitted enqueues the validating relayer job

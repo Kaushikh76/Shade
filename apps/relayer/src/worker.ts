@@ -3,8 +3,8 @@ import { JsonRpcProvider } from "ethers";
 import { JobQueue, type ServiceJob } from "@shade/queue";
 import { sorobanInvoke } from "@shade/stellar-utils";
 import { LOCKED_CCTP, fetchAttestationByTx, stellarContractToBytes32 } from "@shade/cctp-utils";
-import { runCctpInbound } from "../../cli/src/lib/cctp-inbound.js";
-import type { GeneratedCoin } from "../../cli/src/lib/prove.js";
+import { runCctpInbound } from "@shade/cctp";
+import type { GeneratedCoin } from "@shade/proving";
 
 // PHASE 2 relayer worker. Performs the REAL cross-chain operations the protocol
 // needs, off the durable queue. It reuses the proven CLI flows (runCctpInbound +
