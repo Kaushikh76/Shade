@@ -4,6 +4,7 @@ import { LOCKED_CCTP, usdc6ToStellar7, validateInboundRoute } from "@shade/cctp-
 import { generateNotePreimage, poseidonCommitment } from "@shade/note-crypto";
 import { hashJson, deterministicId } from "@shade/shared-types/ids";
 import { intentSchema, quoteSchema } from "@shade/rfq-types";
+import { JobQueue } from "@shade/queue";
 import { Store } from "./db.js";
 import {
   cctpExitSchema,
@@ -21,7 +22,7 @@ function idem(request: FastifyRequest): string {
   return idempotencyHeader.parse(request.headers)["idempotency-key"];
 }
 
-export async function registerRoutes(app: FastifyInstance, store = new Store()): Promise<void> {
+export async function registerRoutes(app: FastifyInstance, store = new Store(), queue = new JobQueue()): Promise<void> {
   app.get("/health", async () => {
     await store.health();
     return { ok: true };
@@ -112,9 +113,20 @@ export async function registerRoutes(app: FastifyInstance, store = new Store()):
       status: "queued"
     });
     await store.transition({ entityType: "proof_job", entityId: proofJobId, toState: "queued" });
-    return { proof_job_id: proofJobId, status: "queued" };
+    // Enqueue the real prover job (the prover worker generates the Groth16 proof).
+    // The witness payload (coin path + binding) is supplied by the client/relayer.
+    const job = await queue.enqueue("prover", body.proof_type, (body.witness ?? {}) as Record<string, unknown>, `proof:${proofJobId}`);
+    return { proof_job_id: proofJobId, job_id: job.job_id, status: "queued" };
   });
   app.get("/v1/proofs/:proof_job_id", async (request) => store.getById("proof_jobs", "proof_job_id", (request.params as { proof_job_id: string }).proof_job_id));
+
+  // PHASE 2 generic job status (prover/relayer queue): status + non-secret result + events.
+  app.get("/v1/jobs/:job_id", async (request) => {
+    const id = (request.params as { job_id: string }).job_id;
+    const job = await queue.getJob(id);
+    if (!job) { const e = new Error("job not found") as Error & { statusCode: number }; e.statusCode = 404; throw e; }
+    return { job_id: job.job_id, type: job.job_type, queue: job.queue, status: job.status, attempts: job.attempts, result: job.result, error: job.error, events: await queue.getEvents(id) };
+  });
 
   app.post("/v1/withdrawals/prepare", async (request) => { await assertRootHealthy(store); return createWithdrawal(request, store); });
   app.post("/v1/withdrawals/submit", async () => failLive("withdraw submit requires proof and Stellar transaction"));

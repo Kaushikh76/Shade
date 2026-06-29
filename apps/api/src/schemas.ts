@@ -18,8 +18,11 @@ export const prepareDepositSchema = z.object({
 });
 
 export const proofRequestSchema = z.object({
-  proof_type: z.enum(["deposit", "withdraw", "rfq", "fill_claim"]),
-  public_inputs: z.record(z.unknown())
+  // Canonical proof job types — aligned with the prover worker (PHASE 2).
+  proof_type: z.enum(["deposit_note_mint", "withdraw_public", "withdraw_cctp", "rfq_settlement", "private_transfer"]),
+  public_inputs: z.record(z.unknown()),
+  // Prover payload (coin path + binding params); passed through to the prover queue.
+  witness: z.record(z.unknown()).optional()
 });
 
 export const withdrawalSchema = z.object({
