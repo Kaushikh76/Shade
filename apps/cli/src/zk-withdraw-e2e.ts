@@ -60,7 +60,9 @@ const inbound = await runCctpInbound(env, {
   policyIdHex: "0x" + createHash("sha256").update("shade:default-testnet-policy:v1").digest("hex").slice(0, 64),
   fast: true,
   targetContract: pool,
-  newRootHex: rootAfterReal
+  newRootHex: rootAfterReal,
+  coin: realCoin,
+  scratch: SCRATCH
 });
 results.push({ name: "CCTP fund pool (real note)", ok: true, detail: `${inbound.burnTxHash.slice(0, 14)}... leaf ${inbound.leafIndex}` });
 

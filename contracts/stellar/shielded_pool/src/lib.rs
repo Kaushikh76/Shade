@@ -22,6 +22,7 @@ use soroban_sdk::{
 const OP_WITHDRAW_PUBLIC: i128 = 1;
 const OP_WITHDRAW_CCTP: i128 = 2;
 const OP_RFQ_SETTLEMENT: i128 = 3;
+const OP_DEPOSIT_NOTE_MINT: i128 = 4; // P1.8 deposit circuit op type
 
 // Off-chain-root design: the authorized registrar (admin/relayer) maintains the
 // Poseidon incremental Merkle tree off-chain at native speed (the same lean-imt
@@ -60,6 +61,8 @@ pub enum Error {
     WrongDestRecipient = 18,// P1.7 destination_recipient arg != bound in proof
     WrongMaxFee = 19,       // P1.7 max_fee arg != bound in proof
     WrongFinality = 20,     // P1.7 min_finality_threshold arg != bound in proof
+    WrongCommitment = 21,   // P1.8 commitment arg != commitment bound in deposit proof
+    WrongDepositField = 22, // P1.8 a deposit CCTP field arg != value bound in proof
 }
 
 const ADMIN: Symbol = symbol_short!("admin");
@@ -72,6 +75,7 @@ const POOLID: Symbol = symbol_short!("poolid"); // #3 domain separator bound in 
 const CHAINID: Symbol = symbol_short!("chainid"); // #3 domain separator bound in proofs
 const ASSOCROOT: Symbol = symbol_short!("assocroot"); // #4 ASP allowlist root bound in proofs
 const XVERIFIER: Symbol = symbol_short!("xverifier"); // #2 PrivateTransfer verifier (separate circuit/vk)
+const DEPVERIFIER: Symbol = symbol_short!("depverif"); // P1.8 DepositNoteMint verifier (separate circuit/vk)
 
 #[contracttype]
 enum DataKey {
@@ -113,12 +117,21 @@ impl ShieldedPool {
         env.storage().persistent().set(&DataKey::KnownRoot(empty_root), &true);
     }
 
-    /// Register a note commitment (funded by a prior CCTP mint into this contract).
-    /// `cctp_nonce` is a dedup key. Admin-gated registrar.
     /// Register a note commitment funded by a prior CCTP mint into this contract.
     /// `new_root` is the post-insert Merkle root computed off-chain by the
     /// registrar (admin) using the same Poseidon lean-imt as the circuit.
     /// Admin-gated; the commitment is emitted on-chain so the root is auditable.
+    ///
+    /// P1.8: a DepositNoteMint proof binds the note commitment to its private
+    /// opening AND to the CCTP message fields. The contract verifies the proof and
+    /// checks that every binding arg equals the corresponding proof public signal,
+    /// so a registrar cannot insert a commitment that does not correspond to the
+    /// deposit it claims (wrong amount, wrong nonce, wrong asset, etc.).
+    ///
+    /// Deposit pub signals (14): [0] commitment [1] operationType [2] sourceDomain
+    /// [3] destinationDomain [4] cctpNonceHash [5] burnTxHashHash [6] amount6dp
+    /// [7] amount7dp [8] assetIdHash [9] recipientPool [10] encryptedNotePayloadHash
+    /// [11] policyIdHash [12] poolId [13] chainId.
     pub fn receive_cctp_deposit(
         env: Env,
         source_domain: u32,
@@ -129,6 +142,8 @@ impl ShieldedPool {
         new_root: BytesN<32>,
         encrypted_note_payload_hash: BytesN<32>,
         policy_id: BytesN<32>,
+        proof_bytes: Bytes,
+        pub_signals_bytes: Bytes,
     ) -> u32 {
         Self::require_not_paused(&env);
         Self::require_admin(&env);
@@ -138,6 +153,59 @@ impl ShieldedPool {
         if env.storage().persistent().has(&DataKey::Deposit(cctp_nonce.clone())) {
             panic_err(&env, Error::DuplicateDeposit);
         }
+
+        // P1.8 deposit proof: verify and bind the CCTP message to the commitment.
+        let signals = parse_public_signals(&env, &pub_signals_bytes);
+        // [0] commitment output must equal the leaf we are inserting.
+        if signals.get(0).unwrap() != commitment {
+            panic_err(&env, Error::WrongCommitment);
+        }
+        // [1] operation type must be DEPOSIT_NOTE_MINT.
+        if fr32_to_i128(&signals.get(1).unwrap()) != OP_DEPOSIT_NOTE_MINT {
+            panic_err(&env, Error::WrongOperation);
+        }
+        // [2] source domain, [7] minted 7dp amount must match the args.
+        if fr32_to_i128(&signals.get(2).unwrap()) != source_domain as i128 {
+            panic_err(&env, Error::WrongDepositField);
+        }
+        if fr32_to_i128(&signals.get(7).unwrap()) != amount {
+            panic_err(&env, Error::WrongDepositField);
+        }
+        // [4] cctp nonce, [10] encrypted-note-payload, [11] policy id (reduced to field).
+        if Self::hash_to_field(&env, &cctp_nonce) != signals.get(4).unwrap() {
+            panic_err(&env, Error::WrongDepositField);
+        }
+        if Self::hash_to_field(&env, &encrypted_note_payload_hash) != signals.get(10).unwrap() {
+            panic_err(&env, Error::WrongDepositField);
+        }
+        if Self::hash_to_field(&env, &policy_id) != signals.get(11).unwrap() {
+            panic_err(&env, Error::WrongDepositField);
+        }
+        // [8] asset id = hash(asset strkey), [9] recipient pool = hash(this contract).
+        if Self::recipient_hash(&env, &asset) != signals.get(8).unwrap() {
+            panic_err(&env, Error::WrongDepositField);
+        }
+        if Self::recipient_hash(&env, &env.current_contract_address()) != signals.get(9).unwrap() {
+            panic_err(&env, Error::WrongDepositField);
+        }
+        // [12] poolId, [13] chainId must match this pool's domain (#3).
+        let pool_id: u32 = env.storage().instance().get(&POOLID).unwrap();
+        let chain_id: u32 = env.storage().instance().get(&CHAINID).unwrap();
+        if fr32_to_i128(&signals.get(12).unwrap()) != pool_id as i128
+            || fr32_to_i128(&signals.get(13).unwrap()) != chain_id as i128 {
+            panic_err(&env, Error::WrongDomain);
+        }
+        // Verify the DepositNoteMint Groth16 proof against its dedicated verifier.
+        let dep_verifier: Address = env.storage().instance().get(&DEPVERIFIER).unwrap();
+        let ok: bool = env.invoke_contract(
+            &dep_verifier,
+            &Symbol::new(&env, "verify"),
+            vec![&env, proof_bytes.to_val(), pub_signals_bytes.to_val()],
+        );
+        if !ok {
+            panic_err(&env, Error::ProofInvalid);
+        }
+
         let mut leaves: Vec<BytesN<32>> = env.storage().instance().get(&LEAVES_KEY).unwrap_or(Vec::new(&env));
         let leaf_index = leaves.len();
         leaves.push_back(commitment.clone());
@@ -231,6 +299,12 @@ impl ShieldedPool {
     pub fn set_transfer_verifier(env: Env, verifier: Address) {
         Self::require_admin(&env);
         env.storage().instance().set(&XVERIFIER, &verifier);
+    }
+
+    /// P1.8 Set the DepositNoteMint verifier contract (separate circuit/vk).
+    pub fn set_deposit_verifier(env: Env, verifier: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&DEPVERIFIER, &verifier);
     }
 
     /// #2 Hidden-amount shielded transfer: spend an input note, create an output

@@ -263,3 +263,18 @@ See `docs/blockers.md` for the (now minor) remaining items.
 - circuit stateRoot == pool root: PASS - match
 - P1.7 relayer cannot redirect CCTP burn (proof binds recipient): PASS - rejected Error(Contract, #18) WrongDestRecipient
 - proof-bound Stellar CCTP outbound burn: FAIL - stellar contract invoke withdraw_cctp failed: ❌ error: transaction simulation failed: HostError: Error(Contract, #4)  Event log (newest first):
+
+## ZK Withdrawal E2E (#1 anonymity set, #3 domain-sep nullifier, #4 ASP membership)
+
+- required env: PASS - present
+- #1 anonymity set built: FAIL - k=1 (1 real + 0 decoys), fixed denom 5000000 (7dp)
+- #4 ASP association root set on-chain: PASS - 0x0891b62275b75f12...
+- CCTP fund pool (real note): PASS - 0xfde3b4573eff... leaf 0
+- anonymity-set leaves on-chain (shared pool): PASS - pool leaf count 1 (>= k=1 added this run)
+- circuit stateRoot == on-chain root (full anonymity set): PASS - match (k=1)
+- proof generated + locally verified (#3 domain-sep, #4 ASP): PASS - OK
+- user USDC trustline: PASS - established
+- on-chain withdraw (verify + domain + ASP + nullifier + release): PASS - 3996da39fa0aa33de0600398771af287deec4b35a2219ddf1b7ecfb1b1b8fa72
+- P1.5 USDC net received by user (value - fee): PASS - +4900000 7dp (expected net 4900000 = 5000000 - 100000 fee)
+- USDC released from pool: PASS - pool delta 4900000 7dp (release confirmed via recipient credit)
+- double-spend prevented (nullifier spent once): FAIL - NOT rejected!

@@ -37,7 +37,9 @@ const inbound = await runCctpInbound(env, {
   policyIdHex: "0x" + createHash("sha256").update("shade:default-testnet-policy:v1").digest("hex").slice(0, 64),
   fast: true,
   targetContract: pool,
-  newRootHex: rootAfter
+  newRootHex: rootAfter,
+  coin,
+  scratch: SCRATCH
 });
 results.push({ name: "input note funded (CCTP)", ok: true, detail: `leaf ${inbound.leafIndex}` });
 

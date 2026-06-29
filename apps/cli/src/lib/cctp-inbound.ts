@@ -12,6 +12,7 @@ import {
 } from "@shade/cctp-utils";
 import { sorobanInvoke, bytesToCliHex } from "@shade/stellar-utils";
 import type { EnvMap } from "./env.js";
+import { buildDepositProof, type GeneratedCoin } from "./prove.js";
 
 export type InboundParams = {
   amount6: bigint; // USDC in 6dp subunits to burn
@@ -23,6 +24,10 @@ export type InboundParams = {
   targetContract?: string; // override forwardRecipient + receive target (e.g. shielded_pool)
   rootMethod?: string; // method to read the post-insert root on the target (default get_root)
   newRootHex?: string; // off-chain-computed post-insert Merkle root (shielded_pool)
+  coin?: GeneratedCoin; // P1.8: the note (opening) — REQUIRED for shielded_pool deposit proof
+  scratch?: string; // scratch dir for P1.8 deposit proof artifacts
+  poolId?: string; // P1.8 domain separator (default "1")
+  chainId?: string; // P1.8 domain separator (default "148")
 };
 
 export type InboundResult = {
@@ -159,7 +164,28 @@ export async function runCctpInbound(env: EnvMap, p: InboundParams): Promise<Inb
   const amount7 = mintedDelta7;
 
   // 5) Register the note commitment. The shielded_pool takes the off-chain-computed
-  //    post-insert root; the legacy vault (CommitmentTree-backed) does not.
+  //    post-insert root AND a P1.8 DepositNoteMint proof binding the commitment to
+  //    the CCTP message; the legacy vault (CommitmentTree-backed) does neither.
+  let depositProofArgs: string[] = [];
+  if (p.targetContract) {
+    if (!p.coin) throw new Error("P1.8: coin (note opening) required for shielded_pool deposit proof");
+    const dep = buildDepositProof(p.coin, {
+      sourceDomain: String(LOCKED_CCTP.arbitrumSepoliaDomain),
+      destinationDomain: String(LOCKED_CCTP.stellarDomain),
+      cctpNonceHex,
+      burnTxHashHex: burnTxHash,
+      amount6dp: p.amount6.toString(),
+      amount7dp: amount7.toString(),
+      assetStrkey: sac,
+      poolStrkey: p.targetContract,
+      encryptedNotePayloadHashHex: p.encryptedNotePayloadHashHex,
+      policyIdHex: p.policyIdHex,
+      poolId: p.poolId ?? "1",
+      chainId: p.chainId ?? "148"
+    }, p.scratch ?? ".scratch", "inbound");
+    if (!dep.locallyVerified) throw new Error("P1.8 deposit proof failed local verification");
+    depositProofArgs = ["--proof_bytes", dep.proofHex, "--pub_signals_bytes", dep.publicHex];
+  }
   const receiveArgs = [
     "--source_domain", String(LOCKED_CCTP.arbitrumSepoliaDomain),
     "--cctp_nonce", bytesToCliHex(cctpNonceHex),
@@ -168,7 +194,8 @@ export async function runCctpInbound(env: EnvMap, p: InboundParams): Promise<Inb
     "--commitment", bytesToCliHex(p.commitmentHex),
     ...(p.targetContract ? ["--new_root", bytesToCliHex(p.newRootHex ?? (() => { throw new Error("newRootHex required for shielded_pool deposit"); })())] : []),
     "--encrypted_note_payload_hash", bytesToCliHex(p.encryptedNotePayloadHashHex),
-    "--policy_id", bytesToCliHex(p.policyIdHex)
+    "--policy_id", bytesToCliHex(p.policyIdHex),
+    ...depositProofArgs
   ];
   const receive = sorobanInvoke({
     contractId: vault,

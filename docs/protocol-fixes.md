@@ -7,9 +7,10 @@ work. Each is verified on Stellar testnet.
 
 | Contract | ID | Notes |
 |---|---|---|
-| ShadePool (shielded_pool) | `CDW5IPO7IIPC2IBUCLUTZKVNGSJAR62ASXRZZTK5STAQXWAXKOWGCQCE` | canonical settlement contract (P1.7 redeploy) |
+| ShadePool (shielded_pool) | `CDUBLMVIRUAIWICRMY4RWUIEYMMMTFGMYZKENVEPKCTGLDOZHI5SJXQQ` | canonical settlement contract (P1.8 redeploy) |
 | NullifierRegistry | `CBAKCITRZLJZFQC4ISSYH5UESYFUYBFRANVM5VPDA6OH3VDTSLQ2IH67` | authorized-spender locked |
 | VerifierWithdraw | `CCAO4CASJGP57A4SOQTSQO7JWAY4WXXQRU4EUOZGMCR3QF62VOIMCYY5` | admin-gated set_vk; 17-signal vk (P1.7) |
+| VerifierDepositNoteMint | `CC4FGBVT4BYYM5S3NJKJGOLMICQV3HADL5XRHXMXFQEZ5XQ2K2EJHNJO` | admin-gated set_vk; 14-signal vk (P1.8) |
 | VerifierTransfer | `CDBCXL3RLJM7SSZUV2ULCKIKX3FE4KCXRNRFAUXE7PS4YZGDXQSFZ7T5` | admin-gated set_vk |
 
 ## Done
@@ -115,9 +116,41 @@ verifier `CCAO4CASJGP57A4SOQTSQO7JWAY4WXXQRU4EUOZGMCR3QF62VOIMCYY5`):
 - REGRESSION: RFQ (P1.6) still settles against this 17-signal pool — tx
   `2bf31ede4565f83681de9545136a585fd42cd02d4424c59d95fd4a5fe1944c13`. PASS.
 
+### P1.8 — DepositNoteMint circuit (bind CCTP message to the note commitment)
+A NEW, SEPARATE circuit `circuits/deposit_note_mint` (14 public signals; not the
+shared withdraw circuit) and its own verifier. The note opening
+(value/label/nullifier/secret) is private; the circuit OUTPUTS the commitment
+(signal [0]) so it is cryptographically tied to that opening, and enforces
+`value <= amount7dp` in-circuit (anti-inflation: a deposit can't mint a note worth
+more than the USDC that arrived). Public signals:
+`[0] commitment [1] operationType(=4) [2] sourceDomain [3] destinationDomain
+[4] cctpNonceHash [5] burnTxHashHash [6] amount6dp [7] amount7dp [8] assetIdHash
+[9] recipientPool [10] encryptedNotePayloadHash [11] policyIdHash [12] poolId
+[13] chainId`.
+
+The pool gained a `DEPVERIFIER` slot + `set_deposit_verifier` setter (mirroring
+the transfer verifier). `receive_cctp_deposit` now takes `proof_bytes` +
+`pub_signals_bytes` and, BEFORE inserting the leaf, enforces:
+- `commitment arg == signal[0]` (else `#21 WrongCommitment`)
+- `operationType == DEPOSIT_NOTE_MINT (4)` (else `#11 WrongOperation`)
+- `source_domain == signal[2]`, `amount == signal[7]` (else `#22 WrongDepositField`)
+- `hash_to_field(cctp_nonce) == signal[4]`, same for encrypted_note_payload & policy_id (`#22`)
+- `recipient_hash(asset) == signal[8]`, `recipient_hash(this pool) == signal[9]` (`#22`)
+- `poolId/chainId == config` (else `#9 WrongDomain`)
+- DepositNoteMint proof verifies against `DEPVERIFIER` (else `#5 ProofInvalid`)
+The deposit stays admin-gated (registrar) and dedup-by-nonce; the proof closes the
+gap that a registrar could previously insert an arbitrary commitment for a deposit.
+This is Definition-of-Done #8 / phase2 item 8.
+
+On-chain proof (pool `CDUBLMVIRUAIWICRMY4RWUIEYMMMTFGMYZKENVEPKCTGLDOZHI5SJXQQ`,
+deposit verifier `CC4FGBVT4BYYM5S3NJKJGOLMICQV3HADL5XRHXMXFQEZ5XQ2K2EJHNJO`):
+- Deposit-with-proof tx `0xfde3b4573eff...` registered the note (leaf 0); the note
+  was then spent by withdraw tx `3996da39fa0aa33de0600398771af287deec4b35a2219ddf1b7ecfb1b1b8fa72`. PASS.
+- NEGATIVE: tampered `amount` arg → `Error(Contract, #22) WrongDepositField`. PASS.
+- NEGATIVE: tampered `commitment` arg → `Error(Contract, #21) WrongCommitment`. PASS.
+
 ## Remaining PHASE 1 (next)
 
-- **P1.8 — deposit_note_mint circuit** binding the CCTP message to the note.
 - **P1.4/8 — deposit_note_mint circuit** binding the CCTP message to the note.
 - **P1.1 — Canonical naming:** document `shielded_pool` as `ShadePool` and mark
   legacy `ShadeVault`/`CommitmentTree` deprecated (not on the active path).

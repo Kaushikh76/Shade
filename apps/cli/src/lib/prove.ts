@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { writeFileSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 
-import { COINUTILS_BIN, CIRCOM2SOROBAN_BIN, withdrawCircuitDir, transferCircuitDir } from "./paths.js";
+import { COINUTILS_BIN, CIRCOM2SOROBAN_BIN, withdrawCircuitDir, transferCircuitDir, depositCircuitDir } from "./paths.js";
 
 export const COINUTILS = COINUTILS_BIN;
 // Shade's own corrected withdraw circuit (commitment = Poseidon(value,label,precommit),
@@ -194,4 +194,72 @@ export function buildNoteProof(
   const proofHex = execFileSync(C2S, ["proof", proofJson], { encoding: "utf8" }).trim();
   const publicHex = execFileSync(C2S, ["public", publicJson], { encoding: "utf8" }).trim();
   return { proofHex, publicHex, stateRootHex, locallyVerified: /OK!/.test(verify) };
+}
+
+const DEPOSIT_CIRCUITS = depositCircuitDir();
+
+export type DepositProof = {
+  proofHex: string;
+  publicHex: string;
+  commitmentHex: string; // 0x-32-byte, == public signal [0]
+  locallyVerified: boolean;
+};
+
+// P1.8 inputs that bind the CCTP message to the note commitment. Hash fields are
+// reduced to the contract's field element (int(hash[:31])); domains/amounts are
+// decimal. assetIdHash/recipientPool use the strkey-sha256 reduction the contract
+// applies via `recipient_hash` (sha256(strkey)[:31]).
+export type DepositBinding = {
+  sourceDomain: string;
+  destinationDomain: string;
+  cctpNonceHex: string;        // 0x keccak(message); reduced to field
+  burnTxHashHex: string;       // 0x burn tx hash; sha256 then reduced (informational)
+  amount6dp: string;
+  amount7dp: string;           // minted delta (7dp); circuit enforces value <= this
+  assetStrkey: string;         // USDC SAC contract id (C...)
+  poolStrkey: string;          // this pool contract id (C...)
+  encryptedNotePayloadHashHex: string; // 0x sha256; reduced to field
+  policyIdHex: string;         // 0x; reduced to field
+  poolId: string;
+  chainId: string;
+};
+
+// P1.8: build a DepositNoteMint proof. The note opening (value/label/nullifier/
+// secret) comes from the coin file; the public signals bind the CCTP message.
+export function buildDepositProof(coin: GeneratedCoin, b: DepositBinding, scratch: string, tag: string): DepositProof {
+  const opening = JSON.parse(readFileSync(coin.path, "utf8")).coin as {
+    value: string; label: string; nullifier: string; secret: string;
+  };
+  const input = {
+    operationType: "4",
+    sourceDomain: b.sourceDomain,
+    destinationDomain: b.destinationDomain,
+    cctpNonceHash: hashToField(b.cctpNonceHex),
+    burnTxHashHash: hashToField(createHash("sha256").update(b.burnTxHashHex).digest("hex")),
+    amount6dp: b.amount6dp,
+    amount7dp: b.amount7dp,
+    assetIdHash: recipientHashField(b.assetStrkey),
+    recipientPool: recipientHashField(b.poolStrkey),
+    encryptedNotePayloadHash: hashToField(b.encryptedNotePayloadHashHex),
+    policyIdHash: hashToField(b.policyIdHex),
+    poolId: b.poolId,
+    chainId: b.chainId,
+    value: opening.value,
+    label: opening.label,
+    nullifier: opening.nullifier,
+    secret: opening.secret
+  };
+  const inputPath = `${scratch}/${tag}_dep_input.json`;
+  writeFileSync(inputPath, JSON.stringify(input));
+
+  const wtns = `${scratch}/${tag}_dep.wtns`;
+  const proofJson = `${scratch}/${tag}_dep_proof.json`;
+  const publicJson = `${scratch}/${tag}_dep_public.json`;
+  execFileSync("snarkjs", ["wtns", "calculate", `${DEPOSIT_CIRCUITS}/build/main_js/main.wasm`, inputPath, wtns], { encoding: "utf8" });
+  execFileSync("snarkjs", ["groth16", "prove", `${DEPOSIT_CIRCUITS}/output/main_final.zkey`, wtns, proofJson, publicJson], { encoding: "utf8" });
+  const verify = execFileSync("snarkjs", ["groth16", "verify", `${DEPOSIT_CIRCUITS}/output/main_verification_key.json`, publicJson, proofJson], { encoding: "utf8" });
+
+  const proofHex = execFileSync(C2S, ["proof", proofJson], { encoding: "utf8" }).trim();
+  const publicHex = execFileSync(C2S, ["public", publicJson], { encoding: "utf8" }).trim();
+  return { proofHex, publicHex, commitmentHex: coin.commitmentHex, locallyVerified: /OK!/.test(verify) };
 }

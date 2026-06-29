@@ -29,6 +29,9 @@ export function withdrawCircuitDir(): string {
 export function transferCircuitDir(): string {
   return process.env.TRANSFER_CIRCUIT_DIR ?? resolve(CIRCUIT_BUILD_DIR, "private_transfer");
 }
+export function depositCircuitDir(): string {
+  return process.env.DEPOSIT_CIRCUIT_DIR ?? resolve(CIRCUIT_BUILD_DIR, "deposit_note_mint");
+}
 
 let scratchEnsured = false;
 export function scratchDir(): string {

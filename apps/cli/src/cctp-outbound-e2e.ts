@@ -42,7 +42,9 @@ const inbound = await runCctpInbound(env, {
   policyIdHex: "0x" + createHash("sha256").update("shade:default-testnet-policy:v1").digest("hex").slice(0, 64),
   fast: true,
   targetContract: pool,
-  newRootHex: exitRoot
+  newRootHex: exitRoot,
+  coin,
+  scratch: SCRATCH
 });
 results.push({ name: "note funded into pool (CCTP inbound)", ok: true, detail: `leaf ${inbound.leafIndex}` });
 const onchainRoot = poolRead("get_root");
