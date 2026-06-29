@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
+import Link from "next/link";
 import { usePrivy, useWallets } from "@privy-io/react-auth";
 import { ApiClient } from "@/lib/api";
 import { useAccessToken } from "@/lib/use-token";
@@ -46,15 +47,24 @@ export default function Dashboard() {
         })}</ul>
       </section>
       <section>
-        <h2 className="font-semibold">Note vaults ({vaults.length})</h2>
-        <ul className="text-sm text-neutral-400">
-          {vaults.map((v) => { const vv = v as { vault_id: string; backup_status: string; recovery_policy_status: string }; return (
-            <li key={vv.vault_id}>{vv.vault_id.slice(0, 18)}… — backup: {vv.backup_status}, recovery: {vv.recovery_policy_status}</li>
-          ); })}
-          {vaults.length === 0 && <li>No vault yet — create one on the Vault page before depositing.</li>}
-        </ul>
+        <h2 className="font-semibold">Private vault</h2>
+        {(() => {
+          const ready = (vaults as Array<{ vault_id: string; backup_status: string; recovery_policy_status: string }>).filter((v) => v.backup_status === "verified" && (v.recovery_policy_status === "sufficient" || v.recovery_policy_status === "strong"));
+          const onArb = wallets.some((w) => Number((w.chainId ?? "").toString().replace("eip155:", "")) === 421614);
+          if (ready.length === 0) return <div className="text-sm"><p className="text-amber-400">Needs setup</p><p className="text-neutral-400">Next action: <Link href="/vault" className="text-violet-400 underline">Create your private vault</Link></p></div>;
+          const strong = ready.some((v) => v.recovery_policy_status === "strong");
+          return <div className="text-sm">
+            <p className="text-green-400">Ready</p>
+            <p className="text-neutral-400">Recovery: {strong ? "Strong" : "Basic"} · Wallet: {onArb ? "Connected (Arbitrum Sepolia)" : <span className="text-amber-400">Wrong network — switch to Arbitrum Sepolia</span>}</p>
+            <p className="text-neutral-400">Next action: <Link href="/deposit" className="text-violet-400 underline">Deposit privately</Link> · <Link href="/restore" className="text-violet-400 underline">Restore</Link></p>
+          </div>;
+        })()}
       </section>
-      <section><h2 className="font-semibold">System health</h2><pre className="overflow-auto rounded bg-neutral-900 p-3 text-xs">{JSON.stringify(health, null, 2)}</pre></section>
+      <section>
+        <details><summary className="cursor-pointer text-xs text-neutral-600">Advanced: system health</summary>
+          <pre className="mt-2 overflow-auto rounded bg-neutral-900 p-3 text-xs text-neutral-500">{JSON.stringify(health, null, 2)}</pre>
+        </details>
+      </section>
     </div>
   );
 }

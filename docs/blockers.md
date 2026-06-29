@@ -67,7 +67,24 @@ with real transactions (tx hashes in `docs/protocol-fixes.md`):
    the Arbitrum-side mint completes after Circle finalizes the attestation
    (minutes) — a normal CCTP lifecycle follow-up poll, not a blocker.
 
-## Phase-2 PRODUCT wallet architecture (per `audit.md` + `audit2.md`) — P0 FIXES APPLIED
+## Phase-2 PRODUCT wallet architecture (per `audit.md` + `audit2.md` + `audit3.md`) — P0 FIXES APPLIED
+
+### audit3 (vault UX + WebCrypto fix)
+- **Critical bug fixed:** vault creation crashed with `AeadParams: additionalData:
+  Not a BufferSource` because AES-GCM was always given `additionalData` (= undefined
+  on the no-AAD wrapper path). `aesGcmParams()` now omits it when no AAD is given.
+- **Passwordless UX:** vault setup is passkey/wallet-first and downloads an
+  emergency recovery file by default (new `recovery_file_secret` wrapper); password
+  recovery is hidden under Advanced. Deposit auto-selects a verified vault (no typing
+  a vault id) and shows checkout-style steps; restore offers file/Freighter/password.
+- **Finality:** user-burn validation now enforces the CCTP `minFinalityThreshold`.
+- **Honesty:** the relayer stops at `burn_validated` / `awaiting_proof_witness` when
+  no coin witness is supplied and only marks a deposit `active` after a real
+  `receiveDepositTxHash`. The deposit UI surfaces this honestly.
+- **Repo hygiene (PART10) intentionally skipped:** the `frontend/` folder (including
+  `frontend/.next`) is left untouched per the repo owner's instruction; the audit3
+  request to `git rm` those artifacts was not performed.
+
 
 An acceptance audit (`audit2.md`) found 12 P0 gaps in the first wallet pass; all are
 now fixed and gated by `npm run phase2:acceptance` (typecheck + vault + auth-privy +

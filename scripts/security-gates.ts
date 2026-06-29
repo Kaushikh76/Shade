@@ -70,6 +70,27 @@ const gates: Gate[] = [
     // heading but forbid a bare "PRODUCT wallet architecture ... — DONE".
     name: "docs: no Phase-2 DONE/remaining contradiction",
     cmd: `grep -n "wallet architecture.*— DONE\\b" docs/blockers.md || true`
+  },
+  // audit3 PART13 gates.
+  {
+    name: "vault page is not password-first (no prompt before securing)",
+    // the only prompt() allowed is inside the Advanced password handler; the default
+    // createVault path must not call prompt(). Fail if prompt appears before the
+    // "Advanced" marker line.
+    cmd: `awk '/async function addPasswordRecovery/{adv=1} /\\bprompt\\(/ && !adv && $0 !~ /^[[:space:]]*\\/\\// {print FILENAME":"NR": "$0}' apps/web/src/app/vault/page.tsx || true`
+  },
+  {
+    name: "deposit page has NO manual vault id input",
+    cmd: `grep -rni 'verified vault id\\|placeholder="vault-' apps/web/src/app/deposit/page.tsx || true`
+  },
+  {
+    name: "no additionalData: bs(aad) pattern (the AES-GCM crash)",
+    cmd: `grep -rn 'additionalData: bs(aad)' packages/note-vault/src/index.ts || true`
+  },
+  {
+    name: "UI does not show raw CCTP_INBOUND_AFTER_USER_BURN as primary text",
+    // allowed in non-display contexts; forbid it appearing in JSX text of web pages.
+    cmd: `grep -rn 'CCTP_INBOUND_AFTER_USER_BURN' apps/web/src/app 2>/dev/null || true`
   }
 ];
 
