@@ -15,12 +15,20 @@ include "poseidon.circom";
 //       ENFORCED (the caller supplies a real, non-zero associationRoot and a
 //       valid Merkle path for the note's label).
 template Withdraw(treeDepth, associationDepth) {
-    // PUBLIC SIGNALS (order here defines public-signal indices after the output)
-    signal input withdrawnValue;        // [1]
-    signal input stateRoot;             // [2] a known state root
-    signal input associationRoot;       // [3] ASP allowlist root (MUST be non-zero)
-    signal input poolId;                // [4] domain separator: this pool
-    signal input chainId;               // [5] domain separator: this chain
+    // PUBLIC SIGNALS. Final public-signal order (output first, then declared
+    // inputs in the `public [...]` list below):
+    //   [0] nullifierHash  [1] operationType  [2] withdrawnValue
+    //   [3] recipientHash   [4] relayerFee     [5] deadlineLedger
+    //   [6] stateRoot       [7] associationRoot[8] poolId  [9] chainId
+    signal input operationType;         // bound op type; contract requires == WITHDRAW_PUBLIC
+    signal input withdrawnValue;
+    signal input recipientHash;         // sha256(recipient strkey); contract recomputes from `to`
+    signal input relayerFee;            // bound fee; net to recipient = withdrawnValue - relayerFee
+    signal input deadlineLedger;        // bound deadline; contract requires not expired
+    signal input stateRoot;
+    signal input associationRoot;       // ASP allowlist root (MUST be non-zero)
+    signal input poolId;                // domain separator: this pool
+    signal input chainId;               // domain separator: this chain
 
     // PRIVATE SIGNALS
     signal input label;                 // hash(scope, nonce)
@@ -75,6 +83,22 @@ template Withdraw(treeDepth, associationDepth) {
     component withdrawnValueRangeCheck = Num2Bits(128);
     withdrawnValueRangeCheck.in <== withdrawnValue;
     _ <== withdrawnValueRangeCheck.out;
+
+    // relayerFee must be <= withdrawnValue (net to recipient is non-negative).
+    // This both binds relayerFee into the proof and enforces a real relationship.
+    signal netOutput <== withdrawnValue - relayerFee;
+    component netRangeCheck = Num2Bits(128);
+    netRangeCheck.in <== netOutput;
+    _ <== netRangeCheck.out;
+    component feeRangeCheck = Num2Bits(128);
+    feeRangeCheck.in <== relayerFee;
+    _ <== feeRangeCheck.out;
+
+    // Bind operationType, recipientHash, deadlineLedger into the constraint
+    // system (their values are enforced by the contract, not the circuit).
+    signal opBind <== operationType * operationType;
+    signal recBind <== recipientHash * recipientHash;
+    signal dlBind <== deadlineLedger * deadlineLedger;
 }
 
-component main {public [withdrawnValue, stateRoot, associationRoot, poolId, chainId]} = Withdraw(12, 2);
+component main {public [operationType, withdrawnValue, recipientHash, relayerFee, deadlineLedger, stateRoot, associationRoot, poolId, chainId]} = Withdraw(12, 2);

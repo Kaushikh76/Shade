@@ -3,7 +3,7 @@ import { loadRuntimeEnv, requireKeys } from "./lib/env.js";
 import { failIfAny, writeCheckReport, type CheckResult } from "./lib/report.js";
 import { runCctpInbound } from "./lib/cctp-inbound.js";
 import { sorobanInvoke, createTrustline, bytesToCliHex } from "@shade/stellar-utils";
-import { generateCoin, buildNoteProof, computeStateRoot, buildAssociationSet, hexRoot } from "./lib/prove.js";
+import { generateCoin, buildNoteProof, computeStateRoot, buildAssociationSet, hexRoot, recipientHashField } from "./lib/prove.js";
 import { LOCKED_CCTP } from "@shade/cctp-utils";
 
 import { scratchDir } from "./lib/paths.js";
@@ -98,7 +98,15 @@ for (let i = 0; i < 10; i++) {
 }
 
 // 4) Build the withdrawal proof against the FULL k-leaf tree (real note hidden among decoys).
-const proof = buildNoteProof(realCoin, leafSet, "shade_pool", SCRATCH, "zkw", assoc.assocPath);
+//    P1.5: bind operation=WITHDRAW_PUBLIC, recipient=userPub, a relayer fee, and a deadline.
+const RELAYER_FEE = process.env.ZKW_FEE_7DP ?? "100000"; // 0.01 USDC
+const binding = {
+  operationType: "1",
+  recipientHash: recipientHashField(userPub),
+  relayerFee: RELAYER_FEE,
+  deadlineLedger: "4000000000"
+};
+const proof = buildNoteProof(realCoin, leafSet, "shade_pool", SCRATCH, "zkw", assoc.assocPath, binding);
 const rootMatch = proof.stateRootHex.toLowerCase() === ("0x" + finalRoot.toLowerCase());
 results.push({ name: "circuit stateRoot == on-chain root (full anonymity set)", ok: rootMatch, detail: rootMatch ? `match (k=${leafSet.length})` : `circuit ${proof.stateRootHex} vs chain 0x${finalRoot}` });
 results.push({ name: "proof generated + locally verified (#3 domain-sep, #4 ASP)", ok: proof.locallyVerified, detail: proof.locallyVerified ? "OK" : "FAILED" });
@@ -121,12 +129,13 @@ const withdraw = sorobanInvoke({
   rpcUrl: rpc, passphrase: pass
 });
 results.push({ name: "on-chain withdraw (verify + domain + ASP + nullifier + release)", ok: !!withdraw.txHash, detail: withdraw.txHash });
-// poll the recipient balance until the release reflects (read-after-write lag).
+// P1.5: recipient receives NET = value - relayerFee; the fee stays in the pool.
+const netExpected = BigInt(realCoin.value7dp) - BigInt(RELAYER_FEE);
 let received = 0n;
-for (let i = 0; i < 10; i++) { received = userUsdc() - userBefore; if (received >= BigInt(realCoin.value7dp)) break; sleepSync(3000); }
-results.push({ name: "USDC received by user", ok: received === BigInt(realCoin.value7dp), detail: `+${received} 7dp (expected ${realCoin.value7dp})` });
+for (let i = 0; i < 10; i++) { received = userUsdc() - userBefore; if (received >= netExpected) break; sleepSync(3000); }
+results.push({ name: "P1.5 USDC net received by user (value - fee)", ok: received === netExpected, detail: `+${received} 7dp (expected net ${netExpected} = ${realCoin.value7dp} - ${RELAYER_FEE} fee)` });
 const poolDelta = poolBefore - BigInt(poolRead("usdc_balance"));
-results.push({ name: "USDC released from pool", ok: received === BigInt(realCoin.value7dp), detail: `pool delta ${poolDelta} 7dp (release confirmed via recipient credit)` });
+results.push({ name: "USDC released from pool", ok: received === netExpected, detail: `pool delta ${poolDelta} 7dp (release confirmed via recipient credit)` });
 void poolDelta;
 
 // 7) Double-spend prevented. Wait until the nullifier spend has propagated, then

@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { writeFileSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 
 import { COINUTILS_BIN, CIRCOM2SOROBAN_BIN, withdrawCircuitDir, transferCircuitDir } from "./paths.js";
 
@@ -109,11 +110,40 @@ export type NoteProof = {
 // Build a Groth16 note-ownership proof for a coin against a state tree of
 // `commitmentsDecimal`. Requires an ASP association-set file (#4 enforced).
 // `commitmentsDecimal` is the full leaf set in the pool (anonymity set, #1).
-export function buildNoteProof(coin: GeneratedCoin, commitmentsDecimal: string[], scope: string, scratch: string, tag: string, assocPath: string): NoteProof {
+// P1.5 operation-binding fields for the withdraw circuit.
+export type WithdrawBinding = {
+  operationType: string; // "1" withdraw, "2" cctp, "3" rfq
+  recipientHash: string; // decimal field element = int(sha256(strkey)[:31])
+  relayerFee: string;    // 7dp
+  deadlineLedger: string;
+};
+
+// recipient_hash field element matching the contract: sha256(strkey)[:31 bytes].
+export function recipientHashField(strkey: string): string {
+  const sha = createHash("sha256").update(strkey).digest();
+  return BigInt("0x" + sha.subarray(0, 31).toString("hex")).toString();
+}
+
+export function buildNoteProof(
+  coin: GeneratedCoin,
+  commitmentsDecimal: string[],
+  scope: string,
+  scratch: string,
+  tag: string,
+  assocPath: string,
+  binding?: WithdrawBinding
+): NoteProof {
+  const b = binding ?? { operationType: "1", recipientHash: "0", relayerFee: "0", deadlineLedger: "0" };
   const statePath = `${scratch}/${tag}_state.json`;
   writeFileSync(statePath, JSON.stringify({ commitments: commitmentsDecimal, scope }));
   const inputPath = `${scratch}/${tag}_input.json`;
-  execFileSync(COINUTILS, ["withdraw", coin.path, statePath, assocPath, "-o", inputPath], { encoding: "utf8" });
+  execFileSync(COINUTILS, [
+    "withdraw", coin.path, statePath, assocPath, "-o", inputPath,
+    "--operation-type", b.operationType,
+    "--recipient-hash", b.recipientHash,
+    "--relayer-fee", b.relayerFee,
+    "--deadline-ledger", b.deadlineLedger
+  ], { encoding: "utf8" });
   const input = JSON.parse(readFileSync(inputPath, "utf8"));
   const stateRootHex = "0x" + BigInt(input.stateRoot).toString(16).padStart(64, "0");
 

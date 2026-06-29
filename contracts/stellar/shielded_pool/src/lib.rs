@@ -8,13 +8,20 @@
 //!   `proof_verifiers` contract, spends the nullifier in the deployed
 //!   `NullifierRegistry` (double-spend prevention), and releases USDC.
 //!
-//! Public signals layout (snarkjs: output first, then declared public inputs):
-//!   [0] nullifierHash   [1] withdrawnValue   [2] stateRoot   [3] associationRoot
+//! Withdraw-family public-signal layout (P1.5, shared withdraw circuit):
+//!   [0] nullifierHash [1] operationType [2] withdrawnValue [3] recipientHash
+//!   [4] relayerFee    [5] deadlineLedger [6] stateRoot     [7] associationRoot
+//!   [8] poolId        [9] chainId
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Bytes,
     BytesN, Env, IntoVal, Symbol, Val, Vec,
 };
+
+// P1.5 operation types bound into the proof public input [1].
+const OP_WITHDRAW_PUBLIC: i128 = 1;
+const OP_WITHDRAW_CCTP: i128 = 2;
+const OP_RFQ_SETTLEMENT: i128 = 3;
 
 // Off-chain-root design: the authorized registrar (admin/relayer) maintains the
 // Poseidon incremental Merkle tree off-chain at native speed (the same lean-imt
@@ -43,6 +50,9 @@ pub enum Error {
     BadAmount = 8,
     WrongDomain = 9,        // #3 pool_id/chain_id in proof != this pool/chain
     WrongAssociation = 10,  // #4 association root in proof != configured ASP root
+    WrongOperation = 11,    // P1.5 operation_type in proof != expected for this fn
+    WrongRecipient = 12,    // P1.5 recipientHash in proof != hash(to)
+    Expired = 13,           // P1.5 deadline_ledger exceeded
 }
 
 const ADMIN: Symbol = symbol_short!("admin");
@@ -135,28 +145,46 @@ impl ShieldedPool {
         leaf_index
     }
 
-    /// Withdraw with a real Groth16/BLS12-381 proof. Verifies, spends the
-    /// nullifier once (double-spend prevention), and releases USDC to `to`.
+    /// Withdraw with a real Groth16/BLS12-381 proof (P1.5: recipient/fee/deadline/
+    /// operation-type are bound into the proof and enforced here). Verifies,
+    /// spends the nullifier once, and releases (withdrawnValue - relayerFee) to
+    /// `to`, keeping the fee in the pool for relayer reimbursement.
     pub fn withdraw(env: Env, to: Address, proof_bytes: Bytes, pub_signals_bytes: Bytes) {
         Self::require_not_paused(&env);
         to.require_auth();
 
         let signals = parse_public_signals(&env, &pub_signals_bytes);
+        let op_type: i128 = fr32_to_i128(&signals.get(1).unwrap());
         let nullifier_hash: BytesN<32> = signals.get(0).unwrap();
-        let withdrawn_value: i128 = fr32_to_i128(&signals.get(1).unwrap());
-        let state_root: BytesN<32> = signals.get(2).unwrap();
-        if withdrawn_value <= 0 {
+        let withdrawn_value: i128 = fr32_to_i128(&signals.get(2).unwrap());
+        let recipient_hash: BytesN<32> = signals.get(3).unwrap();
+        let relayer_fee: i128 = fr32_to_i128(&signals.get(4).unwrap());
+        let deadline_ledger: i128 = fr32_to_i128(&signals.get(5).unwrap());
+        let state_root: BytesN<32> = signals.get(6).unwrap();
+
+        // P1.5 enforce operation type.
+        if op_type != OP_WITHDRAW_PUBLIC {
+            panic_err(&env, Error::WrongOperation);
+        }
+        if withdrawn_value <= 0 || relayer_fee < 0 || relayer_fee > withdrawn_value {
             panic_err(&env, Error::BadAmount);
+        }
+        // P1.5 deadline must not be expired.
+        if (env.ledger().sequence() as i128) > deadline_ledger {
+            panic_err(&env, Error::Expired);
+        }
+        // P1.5 recipient binding: proof's recipientHash must equal the hash of the
+        // actual recipient `to`, so a relayer cannot redirect funds.
+        if recipient_hash != Self::recipient_hash(&env, &to) {
+            panic_err(&env, Error::WrongRecipient);
         }
         // #3/#4 bind pool/chain domain + ASP root.
         Self::check_domain_compliance(&env, &signals);
 
-        // 1) stateRoot must be a known historical root of this pool's tree.
         if !env.storage().persistent().get(&DataKey::KnownRoot(state_root.clone())).unwrap_or(false) {
             panic_err(&env, Error::UnknownRoot);
         }
 
-        // 2) Verify the Groth16 proof on-chain (BLS12-381 pairing_check).
         let verifier: Address = env.storage().instance().get(&VERIFIER).unwrap();
         let ok: bool = env.invoke_contract(
             &verifier,
@@ -167,8 +195,6 @@ impl ShieldedPool {
             panic_err(&env, Error::ProofInvalid);
         }
 
-        // 3) Spend the nullifier exactly once via the NullifierRegistry.
-        //    `spend` panics if already spent -> whole withdraw reverts (no release).
         let nullreg: Address = env.storage().instance().get(&NULLREG).unwrap();
         let _: bool = env.invoke_contract(
             &nullreg,
@@ -176,16 +202,16 @@ impl ShieldedPool {
             vec![&env, env.current_contract_address().to_val(), nullifier_hash.clone().to_val()],
         );
 
-        // 4) Release USDC to the recipient.
+        // Release net (withdrawnValue - relayerFee) to the recipient; fee stays.
+        let net = withdrawn_value - relayer_fee;
         let usdc: Address = env.storage().instance().get(&USDC).unwrap();
         let client = token::TokenClient::new(&env, &usdc);
-        let bal = client.balance(&env.current_contract_address());
-        if bal < withdrawn_value {
+        if client.balance(&env.current_contract_address()) < net {
             panic_err(&env, Error::InsufficientBalance);
         }
-        client.transfer(&env.current_contract_address(), &to, &withdrawn_value);
+        client.transfer(&env.current_contract_address(), &to, &net);
 
-        env.events().publish((symbol_short!("withdraw"),), (to, nullifier_hash, withdrawn_value));
+        env.events().publish((symbol_short!("withdraw"),), (to, nullifier_hash, net, relayer_fee));
     }
 
     /// Set the Stellar CCTP TokenMessengerMinter used for proof-bound outbound.
@@ -294,11 +320,12 @@ impl ShieldedPool {
 
         let signals = parse_public_signals(&env, &pub_signals_bytes);
         let nullifier_hash: BytesN<32> = signals.get(0).unwrap();
-        let amount: i128 = fr32_to_i128(&signals.get(1).unwrap());
-        let state_root: BytesN<32> = signals.get(2).unwrap();
+        let amount: i128 = fr32_to_i128(&signals.get(2).unwrap()); // P1.5 layout: value@2
+        let state_root: BytesN<32> = signals.get(6).unwrap();      // P1.5 layout: stateRoot@6
         if amount <= 0 {
             panic_err(&env, Error::BadAmount);
         }
+        let _ = OP_WITHDRAW_CCTP; // full op-type binding for cctp is P1.7
         Self::check_domain_compliance(&env, &signals);
         if !env.storage().persistent().get(&DataKey::KnownRoot(state_root.clone())).unwrap_or(false) {
             panic_err(&env, Error::UnknownRoot);
@@ -382,11 +409,12 @@ impl ShieldedPool {
 
         let signals = parse_public_signals(&env, &pub_signals_bytes);
         let nullifier_hash: BytesN<32> = signals.get(0).unwrap();
-        let credit: i128 = fr32_to_i128(&signals.get(1).unwrap());
-        let state_root: BytesN<32> = signals.get(2).unwrap();
+        let credit: i128 = fr32_to_i128(&signals.get(2).unwrap()); // P1.5 layout: value@2
+        let state_root: BytesN<32> = signals.get(6).unwrap();      // P1.5 layout: stateRoot@6
         if credit <= 0 {
             panic_err(&env, Error::BadAmount);
         }
+        let _ = OP_RFQ_SETTLEMENT; // full op-type/quote binding for rfq is P1.6
         Self::check_domain_compliance(&env, &signals);
         if !env.storage().persistent().get(&DataKey::KnownRoot(state_root.clone())).unwrap_or(false) {
             panic_err(&env, Error::UnknownRoot);
@@ -463,12 +491,12 @@ impl ShieldedPool {
     }
 
     /// Verify the proof's public signals bind this pool's domain (#3) and the
-    /// configured ASP allowlist root (#4). signals layout:
-    /// [0]=nullifierHash [1]=withdrawnValue [2]=stateRoot [3]=associationRoot [4]=poolId [5]=chainId
+    /// configured ASP allowlist root (#4). Withdraw-family layout (P1.5):
+    /// [7]=associationRoot [8]=poolId [9]=chainId
     fn check_domain_compliance(env: &Env, signals: &Vec<BytesN<32>>) {
-        let assoc_in: BytesN<32> = signals.get(3).unwrap();
-        let pool_in: i128 = fr32_to_i128(&signals.get(4).unwrap());
-        let chain_in: i128 = fr32_to_i128(&signals.get(5).unwrap());
+        let assoc_in: BytesN<32> = signals.get(7).unwrap();
+        let pool_in: i128 = fr32_to_i128(&signals.get(8).unwrap());
+        let chain_in: i128 = fr32_to_i128(&signals.get(9).unwrap());
         let pool_id: u32 = env.storage().instance().get(&POOLID).unwrap();
         let chain_id: u32 = env.storage().instance().get(&CHAINID).unwrap();
         if pool_in != pool_id as i128 || chain_in != chain_id as i128 {
@@ -478,6 +506,23 @@ impl ShieldedPool {
         if assoc_in != assoc_expected {
             panic_err(env, Error::WrongAssociation);
         }
+    }
+
+    /// P1.5 recipient binding hash: sha256(recipient strkey utf8), high byte
+    /// zeroed so the 32-byte value is a valid BLS12-381 field element (matches
+    /// the off-chain `recipient_hash = int(sha256(strkey)[:31])`). Recipients are
+    /// classic G accounts (56-char strkey) in the current flow.
+    fn recipient_hash(env: &Env, to: &Address) -> BytesN<32> {
+        let s = to.to_string();
+        let mut buf = [0u8; 56];
+        s.copy_into_slice(&mut buf);
+        let sha: [u8; 32] = env.crypto().sha256(&Bytes::from_slice(env, &buf)).to_array();
+        // field element = sha[0..31] as the low 31 bytes (BE), top byte 0.
+        let mut rh = [0u8; 32];
+        for i in 0..31 {
+            rh[i + 1] = sha[i];
+        }
+        BytesN::from_array(env, &rh)
     }
 }
 

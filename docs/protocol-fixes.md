@@ -38,12 +38,34 @@ env-driven `apps/cli/src/lib/paths.ts` module: `SHADE_ROOT` (default
 `CIRCOM2SOROBAN_BIN`, `CIRCUIT_BUILD_DIR`, plus `SHADE_ENV_FILE`. Fresh clones
 resolve everything relative to the repo root. `npm run typecheck` passes.
 
+### P1.5 — WithdrawPublic operation binding (recipient/fee/deadline/op-type)
+The withdraw circuit now has 10 public signals:
+`[nullifierHash, operationType, withdrawnValue, recipientHash, relayerFee,
+deadlineLedger, stateRoot, associationRoot, poolId, chainId]`. The contract
+`withdraw` enforces:
+- `operationType == WITHDRAW_PUBLIC (1)` (else `#11 WrongOperation`)
+- `recipientHash == sha256(to_strkey)[:31]` recomputed on-chain (else
+  `#12 WrongRecipient`) — a relayer cannot redirect funds
+- `relayerFee <= withdrawnValue`; net `value - fee` released to recipient, fee retained
+- `deadlineLedger >= current ledger` (else `#13 Expired`)
+
+On-chain proof (current pool `CCTVKHRPFH3GGUMXWJ3B3KFOGTU6YG3WV263MRK5UL5ELIADA2IVNGTK`):
+- Withdraw tx `bcaf316a4d13d0b9ea79bd7756fdad020fff478814efb4a4dc34f2cd59868172`
+  — net 4900000 (= 5000000 - 100000 fee) released; recipientHash matched. PASS.
+- Relayer redirect to a different recipient rejected with `Error(Contract, #12)`. PASS.
+This is Definition-of-Done #4 ("Withdraw proof binds recipient").
+
+NOTE: withdraw/rfq_settle/withdraw_cctp share this 10-signal circuit; the latter
+two now read the new indices (value@2, stateRoot@6, assoc@7, pool@8, chain@9) so
+they keep working, but their FULL term binding is P1.6/P1.7 (below).
+
 ## Remaining PHASE 1 (next)
 
-- **P1.5/6/7 — Operation-specific binding (highest priority).** Add
-  `operation_type` + recipient/fee/deadline (withdraw), destination/domain/fee/
-  threshold (cctp), and quote_hash/intent/output/fee/solver (rfq) as proof public
-  inputs, with the contract enforcing arg==proof. Separate verifier per op.
+- **P1.6 — RFQ settlement binding:** bind quote_hash, intent_hash, output asset,
+  fee, solver into the proof; contract enforces arg==proof. (Definition-of-Done #6.)
+- **P1.7 — WithdrawCCTP binding:** bind destination_domain, destination_recipient,
+  max_fee, finality_threshold, deadline. (Definition-of-Done #5 for exit.)
+- **P1.8 — deposit_note_mint circuit** binding the CCTP message to the note.
 - **P1.4/8 — deposit_note_mint circuit** binding the CCTP message to the note.
 - **P1.1 — Canonical naming:** document `shielded_pool` as `ShadePool` and mark
   legacy `ShadeVault`/`CommitmentTree` deprecated (not on the active path).

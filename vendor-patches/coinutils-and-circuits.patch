@@ -1,8 +1,27 @@
 diff --git a/privacy-pools/cli/coinutils/src/cli/args.rs b/privacy-pools/cli/coinutils/src/cli/args.rs
-index 440aa84..11840eb 100644
+index 440aa84..8a714d3 100644
 --- a/privacy-pools/cli/coinutils/src/cli/args.rs
 +++ b/privacy-pools/cli/coinutils/src/cli/args.rs
-@@ -38,6 +38,24 @@ pub enum Commands {
+@@ -30,6 +30,18 @@ pub enum Commands {
+         /// Output file path
+         #[arg(short, long, default_value = "withdrawal.json")]
+         output: String,
++        /// P1.5 operation type (WITHDRAW_PUBLIC=1, WITHDRAW_CCTP=2, RFQ_SETTLEMENT=3)
++        #[arg(long, default_value = "1")]
++        operation_type: String,
++        /// P1.5 recipient hash (decimal field element; sha256(strkey) mod p)
++        #[arg(long, default_value = "0")]
++        recipient_hash: String,
++        /// P1.5 relayer fee (7dp), must be <= withdrawn value
++        #[arg(long, default_value = "0")]
++        relayer_fee: String,
++        /// P1.5 deadline ledger
++        #[arg(long, default_value = "0")]
++        deadline_ledger: String,
+     },
+     /// Update association set
+     UpdateAssociation {
+@@ -38,6 +50,24 @@ pub enum Commands {
          /// Label to add
          label: String,
      },
@@ -28,10 +47,47 @@ index 440aa84..11840eb 100644
  
  impl Cli {
 diff --git a/privacy-pools/cli/coinutils/src/cli/commands.rs b/privacy-pools/cli/coinutils/src/cli/commands.rs
-index 92bf7f3..b3499e4 100644
+index 92bf7f3..f6857b9 100644
 --- a/privacy-pools/cli/coinutils/src/cli/commands.rs
 +++ b/privacy-pools/cli/coinutils/src/cli/commands.rs
-@@ -125,6 +125,39 @@ impl CommandHandler {
+@@ -57,12 +57,17 @@ impl CommandHandler {
+     }
+ 
+     /// Handle the withdraw command
++    #[allow(clippy::too_many_arguments)]
+     pub fn handle_withdraw(
+         &self,
+         coin_file: String,
+         state_file: String,
+         association_file: Option<String>,
+         output: String,
++        operation_type: String,
++        recipient_hash: String,
++        relayer_fee: String,
++        deadline_ledger: String,
+     ) -> Result<()> {
+         info!("Processing withdrawal for coin: {}", coin_file);
+         debug!("State file: {}", state_file);
+@@ -86,12 +91,17 @@ impl CommandHandler {
+         };
+ 
+         // Generate withdrawal
+-        let snark_input = self.withdrawal_manager.withdraw_coin(
++        let mut snark_input = self.withdrawal_manager.withdraw_coin(
+             &env,
+             &existing_coin.coin,
+             &state_data,
+             association_set_data.as_ref(),
+         )?;
++        // P1.5 operation-specific bindings (passed through into the proof).
++        snark_input.operation_type = operation_type;
++        snark_input.recipient_hash = recipient_hash;
++        snark_input.relayer_fee = relayer_fee;
++        snark_input.deadline_ledger = deadline_ledger;
+ 
+         // Save withdrawal data
+         let withdrawal_json = self
+@@ -125,6 +135,39 @@ impl CommandHandler {
          println!("Association set updated successfully");
          Ok(())
      }
@@ -89,10 +145,29 @@ index 2aff16c..2c76d4a 100644
 +pub const POOL_ID: &str = "1"; // Shade shielded pool v1
 +pub const CHAIN_ID: &str = "148"; // Stellar (SLIP-44 coin type), testnet domain marker
 diff --git a/privacy-pools/cli/coinutils/src/main.rs b/privacy-pools/cli/coinutils/src/main.rs
-index c920f69..8e834a2 100644
+index c920f69..4c63ea3 100644
 --- a/privacy-pools/cli/coinutils/src/main.rs
 +++ b/privacy-pools/cli/coinutils/src/main.rs
-@@ -22,6 +22,14 @@ fn main() {
+@@ -17,11 +17,32 @@ fn main() {
+             state_file,
+             association_file,
+             output,
+-        } => command_handler.handle_withdraw(coin_file, state_file, association_file, output),
++            operation_type,
++            recipient_hash,
++            relayer_fee,
++            deadline_ledger,
++        } => command_handler.handle_withdraw(
++            coin_file,
++            state_file,
++            association_file,
++            output,
++            operation_type,
++            recipient_hash,
++            relayer_fee,
++            deadline_ledger,
++        ),
+         Commands::UpdateAssociation {
              association_file,
              label,
          } => command_handler.handle_update_association(association_file, label),
@@ -120,23 +195,28 @@ index d0c5252..552a253 100644
 +pub use transfer::*;
  pub use withdrawal::*;
 diff --git a/privacy-pools/cli/coinutils/src/merkle/withdrawal.rs b/privacy-pools/cli/coinutils/src/merkle/withdrawal.rs
-index f112d23..1e26109 100644
+index f112d23..878caab 100644
 --- a/privacy-pools/cli/coinutils/src/merkle/withdrawal.rs
 +++ b/privacy-pools/cli/coinutils/src/merkle/withdrawal.rs
-@@ -110,6 +110,8 @@ impl WithdrawalManager {
+@@ -110,6 +110,13 @@ impl WithdrawalManager {
              association_root,
              label_index,
              label_siblings,
 +            pool_id: crate::config::POOL_ID.to_string(),
 +            chain_id: crate::config::CHAIN_ID.to_string(),
++            // P1.5 defaults; overridden by handle_withdraw from CLI args.
++            operation_type: "1".to_string(),
++            recipient_hash: "0".to_string(),
++            relayer_fee: "0".to_string(),
++            deadline_ledger: "0".to_string(),
          })
      }
  
 diff --git a/privacy-pools/cli/coinutils/src/types/snark.rs b/privacy-pools/cli/coinutils/src/types/snark.rs
-index eeba96a..aad6313 100644
+index eeba96a..afccd96 100644
 --- a/privacy-pools/cli/coinutils/src/types/snark.rs
 +++ b/privacy-pools/cli/coinutils/src/types/snark.rs
-@@ -20,4 +20,9 @@ pub struct SnarkInput {
+@@ -20,4 +20,18 @@ pub struct SnarkInput {
      pub label_index: String,
      #[serde(rename = "labelSiblings")]
      pub label_siblings: Vec<String>,
@@ -145,4 +225,13 @@ index eeba96a..aad6313 100644
 +    pub pool_id: String,
 +    #[serde(rename = "chainId")]
 +    pub chain_id: String,
++    // P1.5 operation-specific bindings (contract enforces these match args)
++    #[serde(rename = "operationType")]
++    pub operation_type: String,
++    #[serde(rename = "recipientHash")]
++    pub recipient_hash: String,
++    #[serde(rename = "relayerFee")]
++    pub relayer_fee: String,
++    #[serde(rename = "deadlineLedger")]
++    pub deadline_ledger: String,
  }
