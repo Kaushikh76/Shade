@@ -17,10 +17,13 @@ const check = (name: string, ok: boolean, detail = "") => { results.push({ name,
 
 const mint = stellarContractToBytes32(FORWARDER);
 const hook = encodeStellarForwardHook(POOL);
-const good = { amount: 1_000_000n, dom: LOCKED_CCTP.stellarDomain, mint, token: USDC, caller: mint, maxFee: 1000n, finality: LOCKED_CCTP ? 1000 : 1000, hook };
+const good = { amount: 1_000_000n, dom: LOCKED_CCTP.stellarDomain, mint, token: USDC, caller: mint, maxFee: 1000n, finality: 1000, hook };
 
-// Replicates the per-field checks in validateInboundBurnTx (decode + compare).
-function validate(args: { amount: bigint; dom: number; mint: string; token: string; caller: string; maxFee: bigint; finality: number; hook: string }, expectedAmount: bigint, expectedMaxFee: bigint): string | null {
+const EXPECTED_FINALITY = 1000; // FINALITY_THRESHOLD_CONFIRMED
+
+// Replicates the per-field checks in validateInboundBurnTx (decode + compare),
+// including PART8 finality enforcement.
+function validate(args: { amount: bigint; dom: number; mint: string; token: string; caller: string; maxFee: bigint; finality: number; hook: string }, expectedAmount: bigint, expectedMaxFee: bigint, expectedFinality = EXPECTED_FINALITY): string | null {
   const data = iface.encodeFunctionData("depositForBurnWithHook", [args.amount, args.dom, args.mint, args.token, args.caller, args.maxFee, args.finality, args.hook]);
   const d = iface.parseTransaction({ data })!;
   if (BigInt(d.args[0]) !== expectedAmount) return "amount";
@@ -29,6 +32,7 @@ function validate(args: { amount: bigint; dom: number; mint: string; token: stri
   if (String(d.args[3]).toLowerCase() !== USDC.toLowerCase()) return "burnToken";
   if (String(d.args[4]).toLowerCase() !== mint.toLowerCase()) return "destinationCaller";
   if (BigInt(d.args[5]) > expectedMaxFee) return "maxFee";
+  if (Number(d.args[6]) !== expectedFinality) return "finality";
   if (String(d.args[7]).toLowerCase() !== hook.toLowerCase()) return "hookData";
   return null;
 }
@@ -40,6 +44,8 @@ check("wrong mintRecipient rejected", validate({ ...good, mint: stellarContractT
 check("wrong burnToken rejected", validate({ ...good, token: "0x" + "11".repeat(20) }, 1_000_000n, 2000n) === "burnToken");
 check("wrong destinationCaller rejected", validate({ ...good, caller: stellarContractToBytes32(POOL) }, 1_000_000n, 2000n) === "destinationCaller");
 check("excessive maxFee rejected", validate({ ...good, maxFee: 5000n }, 1_000_000n, 2000n) === "maxFee");
+check("PART8: wrong finality threshold rejected", validate({ ...good, finality: 2000 }, 1_000_000n, 2000n) === "finality");
+check("PART8: correct finality threshold accepted", validate({ ...good, finality: EXPECTED_FINALITY }, 1_000_000n, 2000n) === null);
 check("wrong hookData (forwardRecipient) rejected", validate({ ...good, hook: encodeStellarForwardHook(FORWARDER) }, 1_000_000n, 2000n) === "hookData");
 
 // Confirm the relayer worker no longer returns the old placeholder string.

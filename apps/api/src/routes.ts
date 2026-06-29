@@ -288,6 +288,8 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
     const job = await queue.enqueue("relayer", "CCTP_INBOUND_AFTER_USER_BURN", {
       deposit_id: depositId, burn_tx_hash: body.burn_tx_hash, source_wallet_address: body.source_wallet_address,
       expected_amount6: dep.amount_usdc_6dp, commitment: dep.commitment, vault_id: dep.vault_id,
+      // bind the finality + maxFee the prepare step used, so the relayer enforces them.
+      expected_finality: FINALITY_THRESHOLD_CONFIRMED, expected_max_fee6: dep.max_fee ?? undefined,
       encryptedNotePayloadHashHex: dep.encrypted_note_payload_hash, policyIdHex: dep.policy_id
     }, `user-burn:${depositId}`);
     await store.logActivity(auth.userId, { event_type: "deposit.burn_submitted", entity_type: "deposit", entity_id: depositId, tx_hash: body.burn_tx_hash });

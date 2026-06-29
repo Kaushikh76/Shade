@@ -133,7 +133,8 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
     const burnTxHash = String(p.burn_tx_hash);
     const v = await validateInboundBurnTx(env, {
       burnTxHash, expectedSender: String(p.source_wallet_address), expectedAmount6: BigInt(String(p.expected_amount6)),
-      pool, expectedMaxFee6: p.expected_max_fee6 ? BigInt(String(p.expected_max_fee6)) : undefined
+      pool, expectedMaxFee6: p.expected_max_fee6 ? BigInt(String(p.expected_max_fee6)) : undefined,
+      expectedFinality: p.expected_finality !== undefined ? Number(p.expected_finality) : undefined
     });
     await queue.setStatus(job.job_id, "burn_validated", `sender ${v.sender.slice(0, 10)}…, ${v.amount6} (6dp)`);
 
