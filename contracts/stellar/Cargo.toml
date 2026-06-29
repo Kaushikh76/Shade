@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+  "commitment_tree",
+  "nullifier_registry",
+  "compliance_registry",
+  "shade_vault",
+  "intent_escrow",
+  "governance_guardian",
+  "proof_verifiers",
+  "shielded_pool"
+]
+
+[workspace.dependencies]
+soroban-sdk = "23.0.3"
+
+[profile.release]
+overflow-checks = true

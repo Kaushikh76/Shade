@@ -1,0 +1,148 @@
+diff --git a/privacy-pools/cli/coinutils/src/cli/args.rs b/privacy-pools/cli/coinutils/src/cli/args.rs
+index 440aa84..11840eb 100644
+--- a/privacy-pools/cli/coinutils/src/cli/args.rs
++++ b/privacy-pools/cli/coinutils/src/cli/args.rs
+@@ -38,6 +38,24 @@ pub enum Commands {
+         /// Label to add
+         label: String,
+     },
++    /// Build a hidden-amount PrivateTransfer witness (spend input -> output note + fee)
++    Transfer {
++        /// Input coin file path
++        coin_file: String,
++        /// State file path (all pool commitments incl. the input)
++        state_file: String,
++        /// Public fee (7dp), output value = input value - fee
++        fee: String,
++        /// Output scope for the new note
++        #[arg(long, default_value = "shade_transfer_out")]
++        out_scope: String,
++        /// Transfer-input (circuit witness) output path
++        #[arg(short, long, default_value = "transfer.json")]
++        output: String,
++        /// Output-coin file path (the new spendable note)
++        #[arg(long, default_value = "out_coin.json")]
++        out_coin: String,
++    },
+ }
+ 
+ impl Cli {
+diff --git a/privacy-pools/cli/coinutils/src/cli/commands.rs b/privacy-pools/cli/coinutils/src/cli/commands.rs
+index 92bf7f3..b3499e4 100644
+--- a/privacy-pools/cli/coinutils/src/cli/commands.rs
++++ b/privacy-pools/cli/coinutils/src/cli/commands.rs
+@@ -125,6 +125,39 @@ impl CommandHandler {
+         println!("Association set updated successfully");
+         Ok(())
+     }
++
++    /// Handle the transfer command (hidden-amount PrivateTransfer witness)
++    #[allow(clippy::too_many_arguments)]
++    pub fn handle_transfer(
++        &self,
++        coin_file: String,
++        state_file: String,
++        fee: String,
++        out_scope: String,
++        output: String,
++        out_coin: String,
++    ) -> Result<()> {
++        info!("Building PrivateTransfer witness for coin: {}", coin_file);
++        let env = Env::default();
++        env.cost_estimate().budget().reset_unlimited();
++
++        let coin = self.file_manager.read_coin_file(&coin_file)?;
++        let state = self.file_manager.read_state_file(&state_file)?;
++        let manager = crate::merkle::transfer::TransferManager::new();
++        let (witness, new_coin) =
++            manager.build_transfer(&env, &coin.coin, &state, &fee, out_scope.as_bytes())?;
++
++        std::fs::write(&output, serde_json::to_string_pretty(&witness).map_err(crate::error::CoinUtilsError::Json)?)?;
++        self.file_manager.write_coin_file(&new_coin, &out_coin)?;
++
++        println!("Transfer witness:");
++        println!("  Fee: {}", witness.fee_public);
++        println!("  Output value: {}", witness.out_value);
++        println!("  Output commitment: {}", new_coin.commitment_hex);
++        println!("  Witness saved to: {}", output);
++        println!("  Output coin saved to: {}", out_coin);
++        Ok(())
++    }
+ }
+ 
+ impl Default for CommandHandler {
+diff --git a/privacy-pools/cli/coinutils/src/config.rs b/privacy-pools/cli/coinutils/src/config.rs
+index 2aff16c..2c76d4a 100644
+--- a/privacy-pools/cli/coinutils/src/config.rs
++++ b/privacy-pools/cli/coinutils/src/config.rs
+@@ -1,5 +1,10 @@
+ /// Configuration constants for the coinutils application
+-pub const COIN_VALUE: i128 = 1000000000; // 1 XLM in stroops
+-pub const TREE_DEPTH: u32 = 20;
++pub const COIN_VALUE: i128 = 5000000; // 0.5 USDC at 7 decimals (Shade) — fixed denomination
++pub const TREE_DEPTH: u32 = 12;
+ pub const ASSOCIATION_TREE_DEPTH: u32 = 2;
+ pub const MAX_ASSOCIATION_LABELS: usize = 4;
++
++// Nullifier domain separators (#3). Must match the shielded_pool contract's
++// configured pool_id / chain_id. nullifierHash = Poseidon(nullifier, pool_id, chain_id).
++pub const POOL_ID: &str = "1"; // Shade shielded pool v1
++pub const CHAIN_ID: &str = "148"; // Stellar (SLIP-44 coin type), testnet domain marker
+diff --git a/privacy-pools/cli/coinutils/src/main.rs b/privacy-pools/cli/coinutils/src/main.rs
+index c920f69..8e834a2 100644
+--- a/privacy-pools/cli/coinutils/src/main.rs
++++ b/privacy-pools/cli/coinutils/src/main.rs
+@@ -22,6 +22,14 @@ fn main() {
+             association_file,
+             label,
+         } => command_handler.handle_update_association(association_file, label),
++        Commands::Transfer {
++            coin_file,
++            state_file,
++            fee,
++            out_scope,
++            output,
++            out_coin,
++        } => command_handler.handle_transfer(coin_file, state_file, fee, out_scope, output, out_coin),
+     };
+ 
+     if let Err(e) = result {
+diff --git a/privacy-pools/cli/coinutils/src/merkle/mod.rs b/privacy-pools/cli/coinutils/src/merkle/mod.rs
+index d0c5252..552a253 100644
+--- a/privacy-pools/cli/coinutils/src/merkle/mod.rs
++++ b/privacy-pools/cli/coinutils/src/merkle/mod.rs
+@@ -1,5 +1,7 @@
+ pub mod association;
++pub mod transfer;
+ pub mod withdrawal;
+ 
+ pub use association::*;
++pub use transfer::*;
+ pub use withdrawal::*;
+diff --git a/privacy-pools/cli/coinutils/src/merkle/withdrawal.rs b/privacy-pools/cli/coinutils/src/merkle/withdrawal.rs
+index f112d23..1e26109 100644
+--- a/privacy-pools/cli/coinutils/src/merkle/withdrawal.rs
++++ b/privacy-pools/cli/coinutils/src/merkle/withdrawal.rs
+@@ -110,6 +110,8 @@ impl WithdrawalManager {
+             association_root,
+             label_index,
+             label_siblings,
++            pool_id: crate::config::POOL_ID.to_string(),
++            chain_id: crate::config::CHAIN_ID.to_string(),
+         })
+     }
+ 
+diff --git a/privacy-pools/cli/coinutils/src/types/snark.rs b/privacy-pools/cli/coinutils/src/types/snark.rs
+index eeba96a..aad6313 100644
+--- a/privacy-pools/cli/coinutils/src/types/snark.rs
++++ b/privacy-pools/cli/coinutils/src/types/snark.rs
+@@ -20,4 +20,9 @@ pub struct SnarkInput {
+     pub label_index: String,
+     #[serde(rename = "labelSiblings")]
+     pub label_siblings: Vec<String>,
++    // #3 nullifier domain separators (must match shielded_pool pool_id/chain_id)
++    #[serde(rename = "poolId")]
++    pub pool_id: String,
++    #[serde(rename = "chainId")]
++    pub chain_id: String,
+ }

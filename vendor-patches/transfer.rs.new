@@ -1,0 +1,150 @@
+use crate::{
+    config::{CHAIN_ID, POOL_ID, TREE_DEPTH},
+    crypto::{coin::generate_commitment, coin::generate_label, conversions::*},
+    error::{CoinUtilsError, Result},
+    types::{CoinData, GeneratedCoin, StateFile},
+};
+use lean_imt::LeanIMT;
+use rand::{thread_rng, Rng};
+use serde::{Deserialize, Serialize};
+use soroban_sdk::{crypto::bls12_381::Fr as BlsScalar, Env};
+
+/// PrivateTransfer circuit witness (hidden-amount transfer).
+#[derive(Serialize, Deserialize)]
+pub struct TransferInput {
+    // public
+    #[serde(rename = "outputCommitment")]
+    pub output_commitment: String,
+    #[serde(rename = "feePublic")]
+    pub fee_public: String,
+    #[serde(rename = "stateRoot")]
+    pub state_root: String,
+    #[serde(rename = "poolId")]
+    pub pool_id: String,
+    #[serde(rename = "chainId")]
+    pub chain_id: String,
+    // private — input note
+    #[serde(rename = "inValue")]
+    pub in_value: String,
+    #[serde(rename = "inLabel")]
+    pub in_label: String,
+    #[serde(rename = "inNullifier")]
+    pub in_nullifier: String,
+    #[serde(rename = "inSecret")]
+    pub in_secret: String,
+    #[serde(rename = "stateSiblings")]
+    pub state_siblings: Vec<String>,
+    #[serde(rename = "stateIndex")]
+    pub state_index: String,
+    // private — output note
+    #[serde(rename = "outValue")]
+    pub out_value: String,
+    #[serde(rename = "outLabel")]
+    pub out_label: String,
+    #[serde(rename = "outNullifier")]
+    pub out_nullifier: String,
+    #[serde(rename = "outSecret")]
+    pub out_secret: String,
+}
+
+pub struct TransferManager;
+
+impl TransferManager {
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Build a PrivateTransfer witness: spend `coin` (input note) and create a new
+    /// output note of value (input - fee). Amounts stay private; only the output
+    /// commitment and public fee are revealed. Returns (witness, output coin).
+    pub fn build_transfer(
+        &self,
+        env: &Env,
+        coin: &CoinData,
+        state_file: &StateFile,
+        fee_decimal: &str,
+        out_scope: &[u8],
+    ) -> Result<(TransferInput, GeneratedCoin)> {
+        // --- input note ---
+        let in_value = decimal_string_to_bls_scalar(env, &coin.value)?;
+        let in_nullifier = decimal_string_to_bls_scalar(env, &coin.nullifier)?;
+        let in_secret = decimal_string_to_bls_scalar(env, &coin.secret)?;
+        let in_label = decimal_string_to_bls_scalar(env, &coin.label)?;
+        let in_commitment = generate_commitment(env, in_value.clone(), in_label.clone(), in_nullifier.clone(), in_secret.clone());
+
+        // membership proof for the input commitment
+        let mut tree = LeanIMT::new(env, TREE_DEPTH);
+        let mut idx = None;
+        for (i, c) in state_file.commitments.iter().enumerate() {
+            let c_fr = decimal_string_to_bls_scalar(env, c)?;
+            tree.insert(lean_imt::bls_scalar_to_bytes(c_fr.clone()))?;
+            if c_fr == in_commitment {
+                idx = Some(i);
+            }
+        }
+        let idx = idx.ok_or(CoinUtilsError::CommitmentNotFound)?;
+        let (siblings, _d) = tree.generate_proof(idx as u32).ok_or(CoinUtilsError::ProofGenerationFailed)?;
+        let state_root = lean_imt::bytes_to_bls_scalar(&tree.get_root());
+
+        // --- output note (value = in - fee), fresh nullifier/secret/label ---
+        let fee = decimal_string_to_bls_scalar(env, fee_decimal)?;
+        // out_value = in_value - fee (compute on big integers via decimal strings)
+        let in_u = to_u128(&coin.value)?;
+        let fee_u = to_u128(fee_decimal)?;
+        if fee_u > in_u {
+            return Err(CoinUtilsError::InvalidDecimal("fee exceeds input value".into()));
+        }
+        let out_u = in_u - fee_u;
+        let out_value = decimal_string_to_bls_scalar(env, &out_u.to_string())?;
+        let out_nullifier = rand_fr(env);
+        let out_secret = rand_fr(env);
+        let nonce = thread_rng().gen::<[u8; 32]>();
+        let out_label = generate_label(env, out_scope, &nonce);
+        let out_commitment = generate_commitment(env, out_value.clone(), out_label.clone(), out_nullifier.clone(), out_secret.clone());
+
+        let _ = (in_label.clone(), fee.clone());
+
+        let witness = TransferInput {
+            output_commitment: bls_scalar_to_decimal_string(&out_commitment),
+            fee_public: fee_decimal.to_string(),
+            state_root: bls_scalar_to_decimal_string(&state_root),
+            pool_id: POOL_ID.to_string(),
+            chain_id: CHAIN_ID.to_string(),
+            in_value: coin.value.clone(),
+            in_label: coin.label.clone(),
+            in_nullifier: coin.nullifier.clone(),
+            in_secret: coin.secret.clone(),
+            state_siblings: siblings.iter().map(|s| bls_scalar_to_decimal_string(&s.clone())).collect(),
+            state_index: idx.to_string(),
+            out_value: out_u.to_string(),
+            out_label: bls_scalar_to_decimal_string(&out_label),
+            out_nullifier: bls_scalar_to_decimal_string(&out_nullifier),
+            out_secret: bls_scalar_to_decimal_string(&out_secret),
+        };
+
+        let out_coin = GeneratedCoin {
+            coin: CoinData {
+                value: out_u.to_string(),
+                nullifier: bls_scalar_to_decimal_string(&out_nullifier),
+                secret: bls_scalar_to_decimal_string(&out_secret),
+                label: bls_scalar_to_decimal_string(&out_label),
+                commitment: bls_scalar_to_decimal_string(&out_commitment),
+            },
+            commitment_hex: format!("0x{}", hex::encode(out_commitment.to_bytes().to_array())),
+        };
+
+        Ok((witness, out_coin))
+    }
+}
+
+fn rand_fr(env: &Env) -> BlsScalar {
+    use soroban_sdk::U256;
+    let mut rng = thread_rng();
+    BlsScalar::from_u256(U256::from_u32(env, rng.gen::<u32>()))
+}
+
+fn to_u128(decimal: &str) -> Result<u128> {
+    decimal
+        .parse::<u128>()
+        .map_err(|e| CoinUtilsError::InvalidDecimal(format!("amount {}: {}", decimal, e)))
+}

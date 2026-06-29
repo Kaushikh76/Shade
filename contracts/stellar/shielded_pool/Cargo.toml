@@ -1,0 +1,19 @@
+[package]
+name = "shielded_pool"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = "25.1.0"
+
+[profile.release]
+overflow-checks = true
+opt-level = "z"
+strip = "symbols"
+panic = "abort"
+codegen-units = 1
+lto = true

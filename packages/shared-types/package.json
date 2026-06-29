@@ -1,0 +1,1 @@
+{"name":"@shade/shared-types","version":"0.1.0","type":"module","exports":{"./ids":"./src/ids.ts",".":"./src/index.ts"}}

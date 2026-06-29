@@ -1,0 +1,12 @@
+[package]
+name = "proof_verifiers"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Pinned to 25.1.0 (Protocol-25 era) for the BLS12-381 typed crypto API
+# (G1Affine/G2Affine/Fr, pairing_check) used by the Groth16 verifier.
+soroban-sdk = "25.1.0"

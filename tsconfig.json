@@ -1,0 +1,24 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "esModuleInterop": true,
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "outDir": "dist",
+    "baseUrl": ".",
+    "paths": {
+      "@shade/shared-types": ["packages/shared-types/src/index.ts"],
+      "@shade/cctp-utils": ["packages/cctp-utils/src/index.ts"],
+      "@shade/stellar-utils": ["packages/stellar-utils/src/index.ts"],
+      "@shade/evm-utils": ["packages/evm-utils/src/index.ts"],
+      "@shade/note-crypto": ["packages/note-crypto/src/index.ts"],
+      "@shade/proof-utils": ["packages/proof-utils/src/index.ts"],
+      "@shade/rfq-types": ["packages/rfq-types/src/index.ts"]
+    }
+  },
+  "include": ["apps/**/*.ts", "packages/**/*.ts", "scripts/**/*.ts"]
+}

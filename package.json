@@ -1,0 +1,55 @@
+{
+  "name": "shade-protocol",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "research:lock": "tsx scripts/research-lock.ts",
+    "setup:testnet": "tsx scripts/setup-env.ts",
+    "setup:fund-solver": "tsx scripts/fund-solver.ts",
+    "contracts:build": "tsx scripts/contracts-build.ts",
+    "contracts:test": "tsx scripts/contracts-test.ts",
+    "contracts:deploy:stellar": "tsx scripts/deploy-stellar-contracts.ts",
+    "contracts:init:stellar": "tsx scripts/init-stellar-contracts.ts",
+    "db:migrate": "tsx scripts/db-migrate.ts",
+    "circuits:build": "tsx scripts/circuits-build.ts",
+    "circuits:test": "tsx scripts/circuits-test.ts",
+    "proofs:test": "tsx apps/prover/src/proofs-test.ts",
+    "api:test": "tsx apps/api/src/api-test.ts",
+    "cctp:inbound:e2e": "tsx apps/cli/src/cctp-inbound-e2e.ts",
+    "zk:withdraw:e2e": "tsx apps/cli/src/zk-withdraw-e2e.ts",
+    "zk:transfer:e2e": "tsx apps/cli/src/private-transfer-e2e.ts",
+    "rfq:e2e": "tsx apps/cli/src/rfq-e2e.ts",
+    "cctp:outbound:e2e": "tsx apps/cli/src/cctp-outbound-e2e.ts",
+    "e2e:all": "tsx apps/cli/src/e2e-all.ts",
+    "test-report": "tsx scripts/test-report.ts",
+    "api:dev": "tsx apps/api/src/server.ts",
+    "relayer:dev": "tsx apps/relayer/src/server.ts",
+    "solver:dev": "tsx apps/solver/src/server.ts",
+    "prover:dev": "tsx apps/prover/src/server.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@iden3/js-crypto": "^1.0.0",
+    "@stellar/stellar-sdk": "^13.3.0",
+    "dotenv": "^16.4.7",
+    "ethers": "^6.13.5",
+    "fastify": "^5.2.1",
+    "pg": "^8.13.1",
+    "uuid": "^11.0.5",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "@types/pg": "^8.11.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

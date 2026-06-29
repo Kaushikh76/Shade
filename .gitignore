@@ -1,0 +1,43 @@
+# --- secrets / env (never commit) ---
+.env
+.env.local
+.env.generated
+.env.*.local
+.env.*.generated
+*.secret
+*.pem
+keystore/
+wallet-keys/
+# keep the template
+!.env.example
+
+# --- node / build ---
+node_modules/
+dist/
+build/
+coverage/
+.DS_Store
+*.log
+*.sqlite
+*.sqlite-*
+target/
+
+# --- ZK artifacts (large / regenerated; keys are sensitive) ---
+*.wasm
+*.r1cs
+*.sym
+*.zkey
+*.ptau
+*.wtns
+witness.wtns
+proving-keys/
+proof-artifacts/
+circuits/**/build/
+circuits/**/output/
+
+# --- external vendored clone (soroban-examples; see vendor-patches/) ---
+.zk-ref/
+
+# --- scratch / generated reports ---
+scratchpad/
+docs/test-report.generated.md
