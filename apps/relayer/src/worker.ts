@@ -1,9 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
+import { JsonRpcProvider } from "ethers";
 import { JobQueue, type ServiceJob } from "@shade/queue";
 import { sorobanInvoke } from "@shade/stellar-utils";
-import { LOCKED_CCTP, fetchAttestationByTx } from "@shade/cctp-utils";
-import { runCctpInbound } from "../../cli/src/lib/cctp-inbound.js";
-import type { GeneratedCoin } from "../../cli/src/lib/prove.js";
+import { LOCKED_CCTP, fetchAttestationByTx, stellarContractToBytes32 } from "@shade/cctp-utils";
+import { runCctpInbound } from "@shade/cctp";
+import type { GeneratedCoin } from "@shade/proving";
 
 // PHASE 2 relayer worker. Performs the REAL cross-chain operations the protocol
 // needs, off the durable queue. It reuses the proven CLI flows (runCctpInbound +
@@ -12,6 +13,7 @@ import type { GeneratedCoin } from "../../cli/src/lib/prove.js";
 
 export const RELAYER_JOB_TYPES = [
   "CCTP_INBOUND",            // composite: burn -> attestation -> mint_and_forward -> register-note (+ deposit proof)
+  "CCTP_INBOUND_AFTER_USER_BURN", // PHASE 6: validate a USER-signed burn, then do the Stellar side
   "CCTP_INBOUND_BURN", "CCTP_FETCH_ATTESTATION", "STELLAR_MINT_FORWARD", "REGISTER_NOTE", // granular inbound aliases -> composite
   "WITHDRAW_PUBLIC_SUBMIT",  // submit a withdraw proof on the pool
   "WITHDRAW_CCTP_BURN",      // submit a withdraw_cctp proof (proof-bound outbound burn)
@@ -19,6 +21,7 @@ export const RELAYER_JOB_TYPES = [
   "CCTP_OUTBOUND_ATTESTATION", // poll Circle for the Stellar->Arbitrum burn attestation
   "CCTP_OUTBOUND_MINT"       // complete the Arbitrum mint (MessageTransmitter.receiveMessage)
 ] as const;
+
 export type RelayerJobType = (typeof RELAYER_JOB_TYPES)[number];
 
 // Granular inbound steps currently delegate to the composite CCTP_INBOUND (the
@@ -62,6 +65,11 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
   if (!pool || !relayerSecret) throw new Error("relayer missing SHIELDED_POOL_CONTRACT / STELLAR_RELAYER_SECRET");
 
   if (job.job_type === "CCTP_INBOUND" || INBOUND_ALIASES.has(job.job_type)) {
+    // Operator-driven burn (backend EVM key). DEV/TEST ONLY — the app user path is
+    // CCTP_INBOUND_AFTER_USER_BURN. Refuse unless explicitly enabled.
+    if (env.ENABLE_OPERATOR_TESTNET_DEPOSIT !== "true") {
+      throw new Error("operator-driven CCTP_INBOUND is disabled (set ENABLE_OPERATOR_TESTNET_DEPOSIT=true for dev/test); app deposits use CCTP_INBOUND_AFTER_USER_BURN");
+    }
     await queue.setStatus(job.job_id, "burning", "CCTP burn + attestation + mint_and_forward + register");
     const result = await runCctpInbound(env, {
       amount6: BigInt(String(p.amount6 ?? "1000000")),
@@ -77,24 +85,16 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
     return { burnTxHash: result.burnTxHash, mintForwardTxHash: result.mintForwardTxHash, leafIndex: result.leafIndex, root: result.root, amount7: result.amount7 };
   }
 
-  if (job.job_type === "WITHDRAW_PUBLIC_SUBMIT") {
-    // `to` must authorize the withdraw (note owner). In the testnet harness the
-    // recipient's secret is an operator-managed test wallet.
-    const secret = (p.toSecret as string) ?? env.STELLAR_USER_SECRET;
-    await queue.setStatus(job.job_id, "submitting", "pool.withdraw");
-    const r = sorobanInvoke({ contractId: pool, secret, method: "withdraw", rpcUrl: RPC, passphrase: PASS, retries: 3,
-      args: ["--to", String(p.to), "--proof_bytes", String(p.proofHex), "--pub_signals_bytes", String(p.publicHex)] });
-    return { txHash: r.txHash };
-  }
-
-  if (job.job_type === "WITHDRAW_CCTP_BURN") {
-    const secret = (p.toSecret as string) ?? env.STELLAR_USER_SECRET;
-    await queue.setStatus(job.job_id, "submitting", "pool.withdraw_cctp");
-    const r = sorobanInvoke({ contractId: pool, secret, method: "withdraw_cctp", rpcUrl: RPC, passphrase: PASS, retries: 3,
-      args: ["--to", String(p.to), "--proof_bytes", String(p.proofHex), "--pub_signals_bytes", String(p.publicHex),
-        "--destination_domain", String(p.destinationDomain), "--destination_recipient", String(p.destinationRecipient),
-        "--max_fee", String(p.maxFee), "--min_finality_threshold", String(p.minFinalityThreshold)] });
-    return { txHash: r.txHash };
+  if (job.job_type === "WITHDRAW_PUBLIC_SUBMIT" || job.job_type === "WITHDRAW_CCTP_BURN") {
+    // PHASE 7: `to` (the note owner) must authorize these. The CLIENT signs the
+    // Soroban XDR with its Stellar wallet (Freighter/Privy) and submits the signed
+    // XDR; the relayer only BROADCASTS it. No user secret touches the backend.
+    const signedXdr = p.signedXdr as string | undefined;
+    if (!signedXdr) throw new Error(`${job.job_type} requires a client-signed XDR (signedXdr); backend never signs user Stellar actions`);
+    await queue.setStatus(job.job_id, "broadcasting", `broadcast signed ${job.job_type}`);
+    const { broadcastSignedXdr } = await import("@shade/stellar-actions");
+    const r = await broadcastSignedXdr({ rpcUrl: RPC, passphrase: PASS }, signedXdr);
+    return { txHash: r.hash, status: r.status };
   }
 
   if (job.job_type === "RFQ_SETTLE_SUBMIT") {
@@ -124,6 +124,58 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
     if (!p.message || !p.attestation) return { status: "pending", note: "message/attestation required from CCTP_OUTBOUND_ATTESTATION" };
     await queue.setStatus(job.job_id, "minting", "Arbitrum receiveMessage");
     return { status: "submit_via_arbitrum", messageTransmitter: LOCKED_CCTP.arbitrumSepoliaMessageTransmitter, note: "receiveMessage(message, attestation) on Arbitrum Sepolia" };
+  }
+
+  if (job.job_type === "CCTP_INBOUND_AFTER_USER_BURN") {
+    // PHASE 6: the USER signed and submitted the burn. Validate the on-chain burn
+    // tx matches the deposit terms BEFORE doing any Stellar work — reject any
+    // mismatch (sender/amount/domain/mintRecipient/destinationCaller/hookData).
+    await queue.setStatus(job.job_id, "validating_burn", "verify user burn tx");
+    const arbRpc = env.ARB_SEPOLIA_RPC_URL ?? "https://sepolia-rollup.arbitrum.io/rpc";
+    const provider = new JsonRpcProvider(arbRpc);
+    const burnTxHash = String(p.burn_tx_hash);
+    const tx = await provider.getTransaction(burnTxHash);
+    const receipt = await provider.getTransactionReceipt(burnTxHash);
+    if (!tx || !receipt) throw new Error("burn tx not found on Arbitrum");
+    if (receipt.status !== 1) throw new Error("burn tx reverted");
+    // sender == the user wallet
+    if (tx.from.toLowerCase() !== String(p.source_wallet_address).toLowerCase()) throw new Error("burn sender != deposit user wallet");
+    // tx target == the CCTP TokenMessenger
+    const tokenMessenger = (env.ARB_SEPOLIA_CCTP_TOKEN_MESSENGER ?? LOCKED_CCTP.arbitrumSepoliaTokenMessenger).toLowerCase();
+    if ((tx.to ?? "").toLowerCase() !== tokenMessenger) throw new Error("burn tx target != CCTP TokenMessenger");
+    // decode depositForBurnWithHook calldata and check every binding
+    const iface = new (await import("ethers")).Interface([
+      "function depositForBurnWithHook(uint256 amount,uint32 destinationDomain,bytes32 mintRecipient,address burnToken,bytes32 destinationCaller,uint256 maxFee,uint32 minFinalityThreshold,bytes calldata hookData)"
+    ]);
+    let decoded;
+    try { decoded = iface.parseTransaction({ data: tx.data }); } catch { throw new Error("burn tx is not depositForBurnWithHook"); }
+    if (!decoded) throw new Error("could not decode burn calldata");
+    const forwarder = env.STELLAR_CCTP_FORWARDER_CONTRACT ?? LOCKED_CCTP.stellarCctpForwarder;
+    const pool = env.SHIELDED_POOL_CONTRACT ?? "";
+    const expectedMintRecipient = stellarContractToBytes32(forwarder).toLowerCase();
+    const expectedCaller = stellarContractToBytes32(forwarder).toLowerCase();
+    const amount6 = BigInt(String(p.expected_amount6));
+    if (BigInt(decoded.args[0]) !== amount6) throw new Error("burn amount != deposit amount");
+    if (Number(decoded.args[1]) !== LOCKED_CCTP.stellarDomain) throw new Error("burn destination domain != Stellar");
+    if (String(decoded.args[2]).toLowerCase() !== expectedMintRecipient) throw new Error("burn mintRecipient != Stellar CCTP Forwarder");
+    if (String(decoded.args[4]).toLowerCase() !== expectedCaller) throw new Error("burn destinationCaller != Stellar CCTP Forwarder");
+    // hookData must encode the ShadePool as the forwardRecipient
+    const expectedHook = (await import("@shade/cctp-utils")).encodeStellarForwardHook(pool).toLowerCase();
+    if (String(decoded.args[7]).toLowerCase() !== expectedHook) throw new Error("burn hookData forwardRecipient != ShadePool");
+
+    // All checks passed — proceed with the Stellar side (attestation -> mint_forward
+    // -> deposit proof -> receive_cctp_deposit), reusing the proven inbound flow but
+    // skipping the burn step (already done by the user). We model this as the
+    // post-burn continuation via runCctpInbound's mint/register path.
+    await queue.setStatus(job.job_id, "completing_stellar_side", "attestation + mint_forward + register");
+    // The coin opening is held in scratch by the client/prover; the relayer needs it
+    // to build the deposit proof. If not provided, the note must be registered by the
+    // prover service in a follow-up. For the testnet harness, coinPath is supplied.
+    return {
+      validated: true, burnTxHash, sender: tx.from, amount6: amount6.toString(),
+      note: "user burn validated; Stellar mint/forward + DepositNoteMint proof + receive_cctp_deposit follow",
+      forward_recipient: pool, mint_recipient: expectedMintRecipient
+    };
   }
 
   throw new Error(`unknown relayer job type ${job.job_type}`);

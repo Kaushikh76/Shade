@@ -5,7 +5,7 @@ import { Contract, JsonRpcProvider, Wallet } from "ethers";
 import { v4 as uuidv4 } from "uuid";
 import { erc20Balance } from "@shade/evm-utils";
 import { LOCKED_CCTP, ERC20_ABI } from "@shade/cctp-utils";
-import { type Quote, quoteHash, signQuoteStellar, priceQuote, usdc7ToDecimal } from "../../cli/src/lib/rfq.js";
+import { type Quote, quoteHash, signQuoteStellar, priceQuote, usdc7ToDecimal } from "@shade/rfq";
 
 // PHASE 2 solver service. Quote-signing is ed25519 over the quote hash (the
 // canonical scheme the on-chain `rfq_settle` verifies, plus the C4 authorized-

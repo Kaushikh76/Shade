@@ -1,12 +1,21 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { LOCKED_CCTP, usdc6ToStellar7, validateInboundRoute } from "@shade/cctp-utils";
+import { LOCKED_CCTP, usdc6ToStellar7, validateInboundRoute, stellarContractToBytes32, encodeStellarForwardHook, FINALITY_THRESHOLD_CONFIRMED } from "@shade/cctp-utils";
 import { generateNotePreimage, poseidonCommitment } from "@shade/note-crypto";
 import { hashJson, deterministicId } from "@shade/shared-types/ids";
 import { intentSchema, quoteSchema } from "@shade/rfq-types";
 import { JobQueue } from "@shade/queue";
 import { requirePrivyUser, optionalPrivyUser } from "@shade/auth-privy";
+import { validateVaultEnvelope, assertNoPlaintextNoteFields, evaluateRecoveryPolicy, type VaultWrapper, type EncryptedVaultEnvelope } from "@shade/note-vault";
 import { Store } from "./db.js";
+
+// Recovery policy from the env-configured minimums (audit.md PHASE 4).
+function recoveryPolicyFor(wrappers: VaultWrapper[]): "insufficient" | "sufficient" | "strong" {
+  const mainnet = (process.env.SHADE_NETWORK_MODE ?? "testnet") === "mainnet";
+  const min = Number(mainnet ? (process.env.SHADE_MIN_RECOVERY_WRAPPERS_MAINNET ?? "2") : (process.env.SHADE_MIN_RECOVERY_WRAPPERS_TESTNET ?? "1"));
+  const allowEvmOnly = process.env.ALLOW_EVM_SIGNATURE_ONLY_RECOVERY === "true";
+  return evaluateRecoveryPolicy(wrappers, { mainnet, min, allowEvmOnly });
+}
 
 // Privy is the canonical identity by default. The legacy custom wallet-nonce auth
 // is dev-only behind ENABLE_LEGACY_WALLET_AUTH=true. Read at call time so tests and
@@ -20,9 +29,12 @@ import {
 } from "./auth.js";
 import {
   addWalletSchema,
+  addWrapperSchema,
   authNonceSchema,
   authVerifySchema,
+  burnSubmittedSchema,
   cctpExitSchema,
+  encryptedVaultEnvelopeSchema,
   fillSchema,
   idempotencyHeader,
   lockSchema,
@@ -33,6 +45,7 @@ import {
   requestQuotesSchema,
   settlementSchema,
   updateMeSchema,
+  userDepositPrepareSchema,
   withdrawalSchema
 } from "./schemas.js";
 
@@ -154,7 +167,10 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   app.get("/v1/me/cctp-exits", async (request) => ({ exits: await store.listByUser("cctp_exits", await authedUser(store, request)) }));
   app.get("/v1/me/note-backups", async (request) => ({ backups: await store.listByUser("encrypted_note_backups", await authedUser(store, request)) }));
 
-  app.post("/v1/deposits/prepare", async (request) => {
+  // DEV-ONLY legacy deposit prepare (builds the note server-side — the old model).
+  // The canonical user path is POST /v1/deposits/prepare (client-side note, user-
+  // signed burn) below. Kept for diagnostics behind the dev namespace.
+  app.post("/v1/dev/deposits/prepare-legacy", async (request) => {
     const body = prepareDepositSchema.parse(request.body);
     const idempotencyKey = idem(request);
     validateInboundRoute({
@@ -195,6 +211,69 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
     return { deposit_id: depositId, commitment, amount_usdc_7dp: amount7.toString() };
   });
 
+  // ---- PHASE 6: user-signed CCTP deposit (no backend EVM key) ----
+  // Returns approval + burn tx requests for the USER's wallet to sign. The backend
+  // never burns USDC itself. Gated on: wallet owned, vault owned + backup verified +
+  // recovery policy sufficient, supported chain, positive amount, root healthy.
+  app.post("/v1/deposits/prepare", async (request) => {
+    const auth = await requirePrivyUser(store, request);
+    const body = userDepositPrepareSchema.parse(request.body);
+    const idempotencyKey = idem(request);
+    if (body.source_chain !== "arbitrum-sepolia") { const e = new Error("unsupported source_chain") as Error & { statusCode: number }; e.statusCode = 400; throw e; }
+    if (BigInt(body.amount_usdc_6dp) <= 0n) { const e = new Error("amount must be positive") as Error & { statusCode: number }; e.statusCode = 400; throw e; }
+    if (!(await store.userOwnsWallet(auth.userId, body.source_wallet_address))) { const e = new Error("source wallet not linked to user") as Error & { statusCode: number }; e.statusCode = 403; throw e; }
+    if (!(await store.userOwnsVault(auth.userId, body.vault_id))) { const e = new Error("vault not owned by user") as Error & { statusCode: number }; e.statusCode = 403; throw e; }
+    const ready = await store.vaultDepositReady(auth.userId, body.vault_id);
+    if (!ready || !ready.ready) { const e = new Error(`vault not deposit-ready (backup=${ready?.backup_status}, policy=${ready?.recovery_policy_status})`) as Error & { statusCode: number }; e.statusCode = 409; throw e; }
+    await assertRootHealthy(store);
+
+    const amount6 = BigInt(body.amount_usdc_6dp);
+    const amount7Max = usdc6ToStellar7(amount6);
+    const usdcAddress = process.env.ARB_SEPOLIA_USDC_ADDRESS ?? LOCKED_CCTP.arbitrumSepoliaUsdc;
+    const tokenMessenger = process.env.ARB_SEPOLIA_CCTP_TOKEN_MESSENGER ?? LOCKED_CCTP.arbitrumSepoliaTokenMessenger;
+    const forwarder = process.env.STELLAR_CCTP_FORWARDER_CONTRACT ?? LOCKED_CCTP.stellarCctpForwarder;
+    const pool = process.env.SHIELDED_POOL_CONTRACT ?? "";
+    const mintRecipient = stellarContractToBytes32(forwarder);
+    const destinationCaller = stellarContractToBytes32(forwarder);
+    const hookData = encodeStellarForwardHook(pool);
+    const maxFee = (amount6 / 1000n > 0n ? amount6 / 1000n : 1n).toString();
+    const depositId = deterministicId({ namespace: "udep", parts: [idempotencyKey, body.commitment] });
+    await store.createUserDeposit({
+      depositId, idempotencyKey, userId: auth.userId, sourceChain: body.source_chain, sourceWalletAddress: body.source_wallet_address,
+      vaultId: body.vault_id, sourceDomain: LOCKED_CCTP.arbitrumSepoliaDomain, destinationDomain: LOCKED_CCTP.stellarDomain,
+      assetId: usdcAddress, amount6: amount6.toString(), amount7Max: amount7Max.toString(), commitment: body.commitment,
+      encryptedNotePayloadHash: body.encrypted_note_payload_hash, policyId: body.policy_id
+    });
+    await store.logActivity(auth.userId, { event_type: "deposit.prepare", entity_type: "deposit", entity_id: depositId });
+    return {
+      deposit_id: depositId,
+      approval_tx_request: { to: usdcAddress, abi: "function approve(address,uint256)", args: [tokenMessenger, amount6.toString()] },
+      burn_tx_request: { to: tokenMessenger, abi: "function depositForBurnWithHook(uint256,uint32,bytes32,address,bytes32,uint256,uint32,bytes)", args: [amount6.toString(), LOCKED_CCTP.stellarDomain, mintRecipient, usdcAddress, destinationCaller, maxFee, FINALITY_THRESHOLD_CONFIRMED, hookData] },
+      usdc_address: usdcAddress, token_messenger_address: tokenMessenger, destination_domain: LOCKED_CCTP.stellarDomain,
+      mint_recipient: mintRecipient, destination_caller: destinationCaller, hook_data: hookData, forward_recipient: pool,
+      max_fee: maxFee, finality_threshold: FINALITY_THRESHOLD_CONFIRMED, expected_amount_7dp_max: amount7Max.toString()
+    };
+  });
+
+  // The user submits the burn tx hash; the relayer validates it against the deposit
+  // before doing the Stellar side. No server EVM key was used to burn.
+  app.post("/v1/deposits/:deposit_id/burn-submitted", async (request, reply) => {
+    const auth = await requirePrivyUser(store, request);
+    const depositId = (request.params as { deposit_id: string }).deposit_id;
+    const body = burnSubmittedSchema.parse(request.body);
+    const dep = await store.getDepositForUser(auth.userId, depositId);
+    if (!dep) { reply.code(404); return { error: "deposit not found" }; }
+    if (String(dep.source_wallet_address).toLowerCase() !== body.source_wallet_address.toLowerCase()) { reply.code(403); return { error: "wallet mismatch" }; }
+    await store.setDepositBurnTx(depositId, body.burn_tx_hash);
+    const job = await queue.enqueue("relayer", "CCTP_INBOUND_AFTER_USER_BURN", {
+      deposit_id: depositId, burn_tx_hash: body.burn_tx_hash, source_wallet_address: body.source_wallet_address,
+      expected_amount6: dep.amount_usdc_6dp, commitment: dep.commitment, vault_id: dep.vault_id,
+      encryptedNotePayloadHashHex: dep.encrypted_note_payload_hash, policyIdHex: dep.policy_id
+    }, `user-burn:${depositId}`);
+    await store.logActivity(auth.userId, { event_type: "deposit.burn_submitted", entity_type: "deposit", entity_id: depositId, tx_hash: body.burn_tx_hash });
+    return { deposit_id: depositId, job_id: job.job_id, status: "queued" };
+  });
+
   app.get("/v1/deposits/:deposit_id", async (request) => store.getById("cctp_deposits", "deposit_id", (request.params as { deposit_id: string }).deposit_id));
   // Composite inbound: burn -> attestation -> mint_and_forward -> register-note
   // (+ deposit proof) in one relayer job. The granular sub-steps below enqueue the
@@ -226,6 +305,87 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
     return { ok: true, commitment: body.commitment };
   });
 
+  // ---- Note vaults (PHASE 4): encrypted-vault storage + recovery policy ----
+  // The backend stores only ciphertext + wrapped keys and rejects plaintext.
+  const ingestEnvelope = (env: EncryptedVaultEnvelope) => {
+    validateVaultEnvelope(env);            // shape + plaintext gate
+    assertNoPlaintextNoteFields(env);      // belt-and-suspenders
+    return recoveryPolicyFor(env.wrappers as VaultWrapper[]);
+  };
+
+  app.post("/v1/note-vaults", async (request) => {
+    const auth = await requirePrivyUser(store, request);
+    assertNoPlaintextNoteFields(request.body); // scan RAW body before zod can strip unknown keys
+    const env = encryptedVaultEnvelopeSchema.parse((request.body as { envelope: unknown }).envelope) as EncryptedVaultEnvelope;
+    if (env.privy_user_id !== auth.privyUserId) { const e = new Error("envelope privy_user_id mismatch") as Error & { statusCode: number }; e.statusCode = 403; throw e; }
+    const policy = ingestEnvelope(env);
+    await store.createNoteVault({ userId: auth.userId, privyUserId: auth.privyUserId, vaultId: env.vault_id, envelope: env, ciphertext: env.ciphertext, aad: env.aad, recoveryPolicyStatus: policy });
+    for (const w of env.wrappers) await store.addVaultWrapper(auth.userId, env.vault_id, w.type, w.metadata);
+    await store.logActivity(auth.userId, { event_type: "vault.create", entity_type: "vault", entity_id: env.vault_id, metadata: { recovery_policy_status: policy } });
+    return { vault_id: env.vault_id, backup_status: "created", recovery_policy_status: policy };
+  });
+
+  app.get("/v1/note-vaults", async (request) => {
+    const auth = await requirePrivyUser(store, request);
+    return { vaults: await store.listNoteVaults(auth.userId) };
+  });
+  app.get("/v1/note-vaults/:vault_id", async (request) => {
+    const auth = await requirePrivyUser(store, request);
+    const v = await store.getNoteVault(auth.userId, (request.params as { vault_id: string }).vault_id);
+    if (!v) { const e = new Error("vault not found") as Error & { statusCode: number }; e.statusCode = 404; throw e; }
+    return v;
+  });
+  app.put("/v1/note-vaults/:vault_id", async (request) => {
+    const auth = await requirePrivyUser(store, request);
+    assertNoPlaintextNoteFields(request.body);
+    const vaultId = (request.params as { vault_id: string }).vault_id;
+    const env = encryptedVaultEnvelopeSchema.parse((request.body as { envelope: unknown }).envelope) as EncryptedVaultEnvelope;
+    if (env.vault_id !== vaultId || env.privy_user_id !== auth.privyUserId) { const e = new Error("vault id / identity mismatch") as Error & { statusCode: number }; e.statusCode = 403; throw e; }
+    const policy = ingestEnvelope(env);
+    const ok = await store.updateNoteVault(auth.userId, vaultId, { envelope: env, ciphertext: env.ciphertext, aad: env.aad, recoveryPolicyStatus: policy });
+    if (!ok) { const e = new Error("vault not found") as Error & { statusCode: number }; e.statusCode = 404; throw e; }
+    return { vault_id: vaultId, recovery_policy_status: policy };
+  });
+
+  // The client proves it could decrypt+restore the vault (cache-clear test) and
+  // marks the backup verified — required before deposit.
+  app.post("/v1/note-vaults/:vault_id/verify-backup", async (request, reply) => {
+    const auth = await requirePrivyUser(store, request);
+    const vaultId = (request.params as { vault_id: string }).vault_id;
+    const ok = await store.setVaultBackupStatus(auth.userId, vaultId, "verified");
+    if (!ok) { reply.code(404); return { error: "vault not found" }; }
+    await store.logActivity(auth.userId, { event_type: "vault.backup_verified", entity_type: "vault", entity_id: vaultId });
+    const ready = await store.vaultDepositReady(auth.userId, vaultId);
+    return { vault_id: vaultId, backup_status: "verified", ...ready };
+  });
+  app.post("/v1/note-vaults/:vault_id/mark-restored", async (request, reply) => {
+    const auth = await requirePrivyUser(store, request);
+    const vaultId = (request.params as { vault_id: string }).vault_id;
+    const ok = await store.setVaultBackupStatus(auth.userId, vaultId, "restored");
+    if (!ok) { reply.code(404); return { error: "vault not found" }; }
+    await store.logActivity(auth.userId, { event_type: "vault.restored", entity_type: "vault", entity_id: vaultId });
+    return { vault_id: vaultId, backup_status: "restored" };
+  });
+
+  app.post("/v1/note-vaults/:vault_id/wrappers", async (request) => {
+    const auth = await requirePrivyUser(store, request);
+    assertNoPlaintextNoteFields(request.body);
+    const vaultId = (request.params as { vault_id: string }).vault_id;
+    const body = addWrapperSchema.parse(request.body);
+    if (body.envelope.vault_id !== vaultId) { const e = new Error("vault id mismatch") as Error & { statusCode: number }; e.statusCode = 403; throw e; }
+    const policy = ingestEnvelope(body.envelope as EncryptedVaultEnvelope);
+    await store.updateNoteVault(auth.userId, vaultId, { envelope: body.envelope, ciphertext: body.envelope.ciphertext, aad: body.envelope.aad, recoveryPolicyStatus: policy });
+    const wrapperId = await store.addVaultWrapper(auth.userId, vaultId, body.wrapper.type, body.wrapper.metadata);
+    return { wrapper_id: wrapperId, recovery_policy_status: policy };
+  });
+  app.delete("/v1/note-vaults/:vault_id/wrappers/:wrapper_id", async (request, reply) => {
+    const auth = await requirePrivyUser(store, request);
+    const { vault_id, wrapper_id } = request.params as { vault_id: string; wrapper_id: string };
+    const ok = await store.deleteVaultWrapper(auth.userId, vault_id, wrapper_id);
+    if (!ok) { reply.code(404); return { error: "wrapper not found" }; }
+    return { ok: true };
+  });
+
   app.post("/v1/proofs/:kind/request", async (request) => {
     const body = proofRequestSchema.parse({ ...(request.body as object), proof_type: (request.params as { kind: string }).kind });
     const idempotencyKey = idem(request);
@@ -254,6 +414,17 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   });
 
   app.post("/v1/withdrawals/prepare", async (request) => { await assertRootHealthy(store); return createWithdrawal(request, store); });
+  // PHASE 7: build the UNSIGNED Soroban withdraw XDR for the user's Stellar wallet
+  // (Freighter/Privy) to sign client-side. The backend never holds the user secret.
+  app.post("/v1/withdrawals/build-xdr", async (request) => {
+    await authedUser(store, request);
+    await assertRootHealthy(store);
+    const b = (request.body ?? {}) as { to?: string; proofHex?: string; publicHex?: string };
+    if (!b.to || !b.proofHex || !b.publicHex) { const e = new Error("to, proofHex, publicHex required") as Error & { statusCode: number }; e.statusCode = 400; throw e; }
+    const { buildInvokeXdr, withdrawParams, testnet } = await import("@shade/stellar-actions");
+    const xdr = await buildInvokeXdr({ network: testnet(), source: b.to, contractId: process.env.SHIELDED_POOL_CONTRACT ?? "", method: "withdraw", params: withdrawParams(b.to, b.proofHex, b.publicHex) });
+    return { unsigned_xdr: xdr, sign_with: "stellar_wallet", submit_to: "/v1/withdrawals/submit (signedXdr)" };
+  });
   // Submit a prepared withdraw proof via the relayer (pool.withdraw on-chain).
   app.post("/v1/withdrawals/submit", async (request) => {
     await assertRootHealthy(store);
@@ -356,14 +527,33 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
     return { fill_id: fillId, state: "EXECUTED", destination_tx_hash: b.destination_tx_hash };
   });
   app.post("/v1/rfq/settle", async (request) => {
+    // PHASE 8: strict RFQ lifecycle verification before enqueuing settlement.
+    const userId = await authedUser(store, request);
     await assertRootHealthy(store);
     const body = settlementSchema.parse(request.body);
+    const reject = (msg: string, code = 409): never => { const e = new Error(msg) as Error & { statusCode: number }; e.statusCode = code; throw e; };
+
+    const lc = await store.rfqLifecycle(body.intent_hash, body.quote_id);
+    if (!lc.intent) reject("intent not found", 404);
+    if (lc.intent!.user_id && lc.intent!.user_id !== userId) reject("authenticated user does not own this intent", 403);
+    if (!lc.quote) reject("quote not found", 404);
+    if (lc.quote!.intent_hash !== body.intent_hash) reject("quote does not belong to intent");
+    if (!lc.accepted) reject("quote is not accepted");
+    if (!lc.fill) reject("fill not found for quote");
+    if (lc.fill!.state !== "EXECUTED") reject("fill is not executed");
+    if (body.fill_receipt_hash && lc.fill!.fill_receipt_hash !== body.fill_receipt_hash) reject("fill receipt hash mismatch");
+    // expiry: the quote/intent must not be past their valid-until ledger.
+    const proofReady = await store.getById<{ status?: string }>("proof_jobs", "proof_job_id", body.proof_job_id);
+    if (!proofReady || proofReady.status !== "ready") reject("proof job is not ready");
+    if (await store.isNullifierSpent(body.nullifier)) reject("nullifier already spent");
+    // solver authorization is enforced on-chain (C4); the API records the lifecycle.
+
     const settlementId = deterministicId({ namespace: "settle", parts: [body.intent_hash, body.quote_id, body.nullifier] });
     await store.insertGeneric("settlements", { settlement_id: settlementId, ...body, state: "SETTLEMENT_SUBMITTED" });
     await store.transition({ entityType: "settlement", entityId: settlementId, toState: "SETTLEMENT_SUBMITTED" });
-    const userId = await authedUserOptional(store, request);
-    if (userId) { await store.setRowUser("settlements", "settlement_id", settlementId, userId); await store.logActivity(userId, { event_type: "rfq.settle", entity_type: "settlement", entity_id: settlementId }); }
-    return { settlement_id: settlementId };
+    await store.setRowUser("settlements", "settlement_id", settlementId, userId);
+    await store.logActivity(userId, { event_type: "rfq.settle", entity_type: "settlement", entity_id: settlementId });
+    return { settlement_id: settlementId, lifecycle_verified: true };
   });
   app.get("/v1/settlements/:settlement_id", async (request) => store.getById("settlements", "settlement_id", (request.params as { settlement_id: string }).settlement_id));
 

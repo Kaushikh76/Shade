@@ -1,0 +1,1 @@
+{"name":"@shade/proving","version":"0.1.0","type":"module","private":true,"exports":{".":"./src/index.ts","./paths":"./src/paths.ts","./env":"./src/env.ts"}}

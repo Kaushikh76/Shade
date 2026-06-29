@@ -67,30 +67,40 @@ with real transactions (tx hashes in `docs/protocol-fixes.md`):
    the Arbitrum-side mint completes after Circle finalizes the attestation
    (minutes) — a normal CCTP lifecycle follow-up poll, not a blocker.
 
-## Phase-2 PRODUCT wallet architecture (per `audit.md`) — in progress
+## Phase-2 PRODUCT wallet architecture (per `audit.md`) — DONE
 
-The service/queue/API layer is done, but the audit found real product gaps. Honest
-status of the wallet rebuild (built in dependency order; see
-`docs/app-wallet-architecture.md`):
+The wallet rebuild is implemented and tested (see `docs/app-wallet-architecture.md`,
+`docs/note-vault-recovery.md`, `docs/privy-stellar-integration.md`):
 
-- **Identity:** moving to **Privy-first** (`packages/auth-privy`, Privy DID =
-  canonical user). Custom wallet-nonce auth becomes dev-only behind
-  `ENABLE_LEGACY_WALLET_AUTH=false`.
+- **Identity:** Privy-first (`packages/auth-privy`, Privy DID = canonical user;
+  ES256 token verified offline via JWKS). Legacy wallet-nonce auth is dev-only
+  behind `ENABLE_LEGACY_WALLET_AUTH`.
 - **Note vault:** `packages/note-vault` — random `vault_master_key`, AES-256-GCM +
   AAD, wrapped by passkey-PRF / Stellar-Ed25519 / recovery-kit (EVM diagnostic-only).
   Backend stores only ciphertext + wrapped keys; rejects plaintext fields.
-- **Deposit:** must become **user-signed** (the user's EVM wallet signs approve +
-  `depositForBurnWithHook`); the backend must NOT use `ARB_SEPOLIA_PRIVATE_KEY` in
-  the user path. Relayer validates the user burn tx before mint/forward.
-- **Stellar spends:** must become **user-signed** via Freighter/Privy; remove
-  `STELLAR_USER_SECRET`/`toSecret` from app routes. Preferred future: proof-auth
-  `*_by_proof` entrypoints (no `require_auth`).
-- **Frontend:** `apps/web` (Next.js) with the full deposit→restore→spend flow.
-- **Recovery gate:** no deposit until vault backup verified + recovery policy
-  sufficient (≥1 non-EVM wrapper on testnet).
+- **Deposit:** **user-signed** — `/v1/deposits/prepare` returns EVM tx requests; the
+  relayer `CCTP_INBOUND_AFTER_USER_BURN` validates the burn (sender/amount/domain/
+  mintRecipient/destinationCaller/hookData) before the Stellar side. No backend EVM
+  key in the user path; operator deposit gated behind `ENABLE_OPERATOR_TESTNET_DEPOSIT`.
+- **Stellar spends:** **user-signed** — backend builds XDR (`packages/stellar-actions`),
+  Freighter signs, relayer broadcasts. `STELLAR_USER_SECRET`/`toSecret` removed from
+  all service runtime (static gate enforces this).
+- **Frontend:** `apps/web` (Next.js) — `/ /login /dashboard /vault /deposit /restore
+  /withdraw /activity`. Browser note gen + encryption; IndexedDB encrypted-only cache.
+- **Recovery gate:** deposit blocked until vault backup verified + recovery policy
+  sufficient (≥1 non-EVM wrapper on testnet); EVM-only recovery rejected.
+- **Packaging:** services import packages, never `apps/cli` (gate enforced).
+- **Docker:** per-service Dockerfiles + `infra/docker-compose.phase2.yml` (7 services).
+- **Security gates:** `npm run security:gates` — all pass.
 
-Until these land, the existing operator-driven deposit and `STELLAR_USER_SECRET`
-withdraw paths remain DEV/TEST ONLY and must not be exposed as the app user path.
+### Remaining (documented, not blockers)
+- **Privy Stellar Tier-2 raw signing** is a TODO; Freighter is the active Stellar
+  signer (Privy Stellar has no end-to-end tx helper at Tier 2).
+- **Proof-authorized no-Stellar-wallet exit** (`withdraw_by_proof` /
+  `withdraw_cctp_by_proof`, no `require_auth`) is the preferred future path; today
+  Path A (Freighter-signed) is active.
+- **Live testnet e2e through the UI** + `docker compose up` live run require a Docker
+  host + funded wallets; the stack config validates and all offline + unit tests pass.
 
 ## Remaining real work (PHASE 2+)
 

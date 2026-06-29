@@ -80,6 +80,34 @@ export class Store {
     }
   }
 
+  // ---- PHASE 6 user-signed deposit ----
+
+  async createUserDeposit(input: {
+    depositId: string; idempotencyKey: string; userId: string; sourceChain: string; sourceWalletAddress: string;
+    vaultId: string; sourceDomain: number; destinationDomain: number; assetId: string; amount6: string; amount7Max: string;
+    commitment: string; encryptedNotePayloadHash: string; policyId: string;
+  }): Promise<void> {
+    await this.pool.query(
+      `insert into cctp_deposits(deposit_id, idempotency_key, user_id, source_chain, source_wallet_address, vault_id,
+        source_domain, destination_domain, asset_id, amount_usdc_6dp, amount_usdc_7dp, commitment,
+        encrypted_note_payload_hash, policy_id, state)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'prepared')
+       on conflict (deposit_id) do nothing`,
+      [input.depositId, input.idempotencyKey, input.userId, input.sourceChain, input.sourceWalletAddress, input.vaultId,
+       input.sourceDomain, input.destinationDomain, input.assetId, input.amount6, input.amount7Max, input.commitment,
+       input.encryptedNotePayloadHash, input.policyId]
+    );
+  }
+
+  async getDepositForUser(userId: string, depositId: string): Promise<Record<string, unknown> | null> {
+    const { rows } = await this.pool.query("select * from cctp_deposits where deposit_id=$1 and user_id=$2", [depositId, userId]);
+    return rows[0] ?? null;
+  }
+
+  async setDepositBurnTx(depositId: string, burnTxHash: string): Promise<void> {
+    await this.pool.query("update cctp_deposits set source_tx_hash=$2, state='burn_submitted', updated_at=now() where deposit_id=$1", [depositId, burnTxHash]);
+  }
+
   async getById<T>(table: string, idColumn: string, id: string): Promise<T | null> {
     const allowedTables = new Set([
       "cctp_deposits",
@@ -135,6 +163,79 @@ export class Store {
   async userOwnsVault(userId: string, vaultId: string): Promise<boolean> {
     const r = await this.pool.query("select 1 from note_vaults where user_id=$1 and vault_id=$2", [userId, vaultId]);
     return (r.rowCount ?? 0) > 0;
+  }
+
+  // ---- Note vaults (PHASE 4) ----
+
+  async createNoteVault(input: { userId: string; privyUserId: string; vaultId: string; envelope: unknown; ciphertext: string; aad: unknown; recoveryPolicyStatus: string }): Promise<void> {
+    await this.pool.query(
+      `insert into note_vaults(user_id, privy_user_id, vault_id, envelope, ciphertext, aad, backup_status, recovery_policy_status)
+       values ($1,$2,$3,$4,$5,$6,'created',$7)
+       on conflict (vault_id) do update set envelope=excluded.envelope, ciphertext=excluded.ciphertext, aad=excluded.aad,
+         recovery_policy_status=excluded.recovery_policy_status, updated_at=now()`,
+      [input.userId, input.privyUserId, input.vaultId, input.envelope, input.ciphertext, input.aad, input.recoveryPolicyStatus]
+    );
+  }
+
+  async listNoteVaults(userId: string): Promise<Array<Record<string, unknown>>> {
+    const { rows } = await this.pool.query(
+      "select vault_id, backup_status, recovery_policy_status, last_backup_verified_at, last_restored_at, created_at, updated_at from note_vaults where user_id=$1 order by created_at desc",
+      [userId]
+    );
+    return rows;
+  }
+
+  async getNoteVault(userId: string, vaultId: string): Promise<Record<string, unknown> | null> {
+    const { rows } = await this.pool.query("select * from note_vaults where user_id=$1 and vault_id=$2", [userId, vaultId]);
+    return rows[0] ?? null;
+  }
+
+  async updateNoteVault(userId: string, vaultId: string, input: { envelope: unknown; ciphertext: string; aad: unknown; recoveryPolicyStatus: string }): Promise<boolean> {
+    const r = await this.pool.query(
+      "update note_vaults set envelope=$3, ciphertext=$4, aad=$5, recovery_policy_status=$6, updated_at=now() where user_id=$1 and vault_id=$2",
+      [userId, vaultId, input.envelope, input.ciphertext, input.aad, input.recoveryPolicyStatus]
+    );
+    return (r.rowCount ?? 0) > 0;
+  }
+
+  async setVaultBackupStatus(userId: string, vaultId: string, status: "verified" | "restored" | "failed"): Promise<boolean> {
+    const col = status === "verified" ? "last_backup_verified_at" : status === "restored" ? "last_restored_at" : null;
+    const set = col ? `, ${col}=now()` : "";
+    const r = await this.pool.query(`update note_vaults set backup_status=$3${set}, updated_at=now() where user_id=$1 and vault_id=$2`, [userId, vaultId, status]);
+    return (r.rowCount ?? 0) > 0;
+  }
+
+  async setVaultRecoveryPolicy(vaultId: string, status: string): Promise<void> {
+    await this.pool.query("update note_vaults set recovery_policy_status=$2, updated_at=now() where vault_id=$1", [vaultId, status]);
+  }
+
+  // Vault deposit-readiness: backup verified AND recovery policy sufficient/strong.
+  async vaultDepositReady(userId: string, vaultId: string): Promise<{ ready: boolean; backup_status: string; recovery_policy_status: string } | null> {
+    const { rows } = await this.pool.query<{ backup_status: string; recovery_policy_status: string }>(
+      "select backup_status, recovery_policy_status from note_vaults where user_id=$1 and vault_id=$2",
+      [userId, vaultId]
+    );
+    if (!rows[0]) return null;
+    const ready = rows[0].backup_status === "verified" && (rows[0].recovery_policy_status === "sufficient" || rows[0].recovery_policy_status === "strong");
+    return { ready, ...rows[0] };
+  }
+
+  async addVaultWrapper(userId: string, vaultId: string, wrapperType: string, metadata: unknown): Promise<string> {
+    const { rows } = await this.pool.query<{ id: string }>(
+      "insert into note_vault_wrappers(vault_id, user_id, wrapper_type, metadata) values ($1,$2,$3,$4) returning id",
+      [vaultId, userId, wrapperType, metadata ?? {}]
+    );
+    return rows[0].id;
+  }
+
+  async deleteVaultWrapper(userId: string, vaultId: string, wrapperId: string): Promise<boolean> {
+    const r = await this.pool.query("delete from note_vault_wrappers where id=$1 and vault_id=$2 and user_id=$3", [wrapperId, vaultId, userId]);
+    return (r.rowCount ?? 0) > 0;
+  }
+
+  async listVaultWrappers(vaultId: string): Promise<Array<{ wrapper_type: string; wrapper_status: string; metadata: Record<string, unknown> }>> {
+    const { rows } = await this.pool.query("select wrapper_type, wrapper_status, metadata from note_vault_wrappers where vault_id=$1", [vaultId]);
+    return rows as Array<{ wrapper_type: string; wrapper_status: string; metadata: Record<string, unknown> }>;
   }
 
   // ---- PHASE 2 auth / users ----
@@ -260,6 +361,27 @@ export class Store {
        on conflict (user_id, commitment) do update set encrypted_payload=excluded.encrypted_payload`,
       [userId, commitment, encryptedPayload, version]
     );
+  }
+
+  // PHASE 8: gather the full RFQ lifecycle state for a settlement request.
+  async rfqLifecycle(intentHash: string, quoteId: string): Promise<{
+    intent: { intent_hash: string; user_id: string | null; expiry_ledger: number } | null;
+    quote: { quote_id: string; intent_hash: string; quote_hash: string; solver_id: string; state: string; valid_until_ledger: number } | null;
+    accepted: boolean;
+    fill: { fill_id: string; quote_id: string; fill_receipt_hash: string; state: string; destination_tx_hash: string | null } | null;
+  }> {
+    const intent = (await this.pool.query("select intent_hash, user_id, expiry_ledger from intents where intent_hash=$1", [intentHash])).rows[0] ?? null;
+    const quote = (await this.pool.query("select quote_id, intent_hash, quote_hash, solver_id, state, valid_until_ledger from quotes where quote_id=$1", [quoteId])).rows[0] ?? null;
+    const accepted = ((await this.pool.query("select 1 from quote_acceptances where quote_id=$1", [quoteId])).rowCount ?? 0) > 0;
+    const fill = (await this.pool.query("select fill_id, quote_id, fill_receipt_hash, state, destination_tx_hash from fills where quote_id=$1 order by created_at desc limit 1", [quoteId])).rows[0] ?? null;
+    return { intent, quote, accepted, fill };
+  }
+
+  async isNullifierSpent(nullifier: string): Promise<boolean> {
+    try {
+      const r = await this.pool.query("select 1 from nullifier_spends where nullifier=$1", [nullifier]);
+      return (r.rowCount ?? 0) > 0;
+    } catch { return false; }
   }
 
   async listQuotesByIntent(intentHash: string): Promise<Array<Record<string, unknown>>> {

@@ -63,6 +63,7 @@ export const settlementSchema = z.object({
   intent_hash: z.string().min(1),
   quote_id: z.string().uuid(),
   fill_id: z.string().optional(),
+  fill_receipt_hash: z.string().optional(),
   proof_job_id: z.string().min(1),
   nullifier: z.string().min(1)
 });
@@ -111,4 +112,52 @@ export const noteBackupSchema = z.object({
 export const requestQuotesSchema = z.object({
   amount: z.string().regex(/^\d+$/),
   expiry_ledger: z.number().int().positive().optional()
+});
+
+// ---- PHASE 4 note-vault schemas ----
+
+const vaultWrapperSchema = z.object({
+  id: z.string(),
+  type: z.enum(["passkey_prf", "stellar_ed25519_signature", "recovery_kit_password", "evm_signature"]),
+  status: z.enum(["active", "revoked"]),
+  kdf: z.enum(["HKDF-SHA256", "PBKDF2-SHA256"]),
+  salt: z.string(),
+  wrapped_key: z.string(),
+  diagnostic_only: z.boolean().optional(),
+  metadata: z.record(z.unknown())
+});
+
+export const encryptedVaultEnvelopeSchema = z.object({
+  version: z.literal("shade-encrypted-vault-v1"),
+  vault_id: z.string().min(1),
+  privy_user_id: z.string().min(1),
+  cipher: z.object({ name: z.literal("AES-256-GCM"), iv: z.string(), tagLength: z.literal(128) }),
+  aad: z.record(z.unknown()),
+  ciphertext: z.string().min(1),
+  wrappers: z.array(vaultWrapperSchema)
+});
+
+export const addWrapperSchema = z.object({
+  wrapper: vaultWrapperSchema,
+  // updated full envelope (the client re-encrypts/re-wraps client-side and uploads)
+  envelope: encryptedVaultEnvelopeSchema
+});
+
+// ---- PHASE 6 user-signed CCTP deposit ----
+
+// The user's wallet signs the burn; the backend never holds the user EVM key.
+export const userDepositPrepareSchema = z.object({
+  amount_usdc_6dp: z.string().regex(/^\d+$/),
+  source_chain: z.string().min(1),                 // "arbitrum-sepolia"
+  source_wallet_address: z.string().regex(/^0x[a-fA-F0-9]{40}$/),
+  vault_id: z.string().min(1),
+  commitment: z.string().min(1),                   // protocol (Poseidon) commitment from the prover
+  encrypted_note_payload_hash: z.string().min(1),
+  policy_id: z.string().min(1)
+});
+
+export const burnSubmittedSchema = z.object({
+  burn_tx_hash: z.string().regex(/^0x[a-fA-F0-9]{64}$/),
+  source_chain: z.string().min(1),
+  source_wallet_address: z.string().regex(/^0x[a-fA-F0-9]{40}$/)
 });

@@ -4,7 +4,7 @@ import { JobQueue, type ServiceJob } from "@shade/queue";
 import {
   buildNoteProof, buildTransferProof, buildDepositProof,
   type GeneratedCoin, type WithdrawBinding, type DepositBinding
-} from "../../cli/src/lib/prove.js";
+} from "@shade/proving";
 
 // PHASE 2 prover worker. Consumes proof jobs from the durable queue and runs the
 // REAL Groth16/BLS12-381 pipeline (the same prove.ts builders the CLI uses):

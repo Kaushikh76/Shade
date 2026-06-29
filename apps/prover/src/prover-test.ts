@@ -1,6 +1,6 @@
 import { resolve } from "node:path";
 import { JobQueue } from "@shade/queue";
-import { generateCoin, buildAssociationSet } from "../../cli/src/lib/prove.js";
+import { generateCoin, buildAssociationSet } from "@shade/proving";
 import { runProverOnce } from "./worker.js";
 
 // PHASE 2 prover test: enqueue real proof jobs of each shape, run the worker, and

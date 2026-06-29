@@ -1,0 +1,102 @@
+# Shade Protocol — full Phase-2 app stack (audit.md PHASE 10).
+#   docker compose -f infra/docker-compose.phase2.yml up --build
+# Secrets come from an env file (NOT baked into images). Copy .env.generated to
+# infra/.env or pass --env-file. Only NEXT_PUBLIC_* reach the browser.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: shade
+      POSTGRES_PASSWORD: shade
+      POSTGRES_DB: shade
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shade"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports: ["5432:5432"]
+    volumes: ["shade-pg:/var/lib/postgresql/data"]
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    ports: ["6379:6379"]
+    restart: unless-stopped
+
+  api:
+    build: { context: .., dockerfile: apps/api/Dockerfile }
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://shade:shade@postgres:5432/shade
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["8080:8080"]
+    restart: unless-stopped
+
+  relayer:
+    build: { context: .., dockerfile: apps/relayer/Dockerfile }
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://shade:shade@postgres:5432/shade
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["8082:8082"]
+    restart: unless-stopped
+
+  prover:
+    build: { context: .., dockerfile: apps/prover/Dockerfile }
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://shade:shade@postgres:5432/shade
+    depends_on:
+      postgres: { condition: service_healthy }
+    # circuit artifacts + circom2soroban + coinutils are large; mount at runtime
+    volumes:
+      - ../circuits:/app/circuits:ro
+      - ../tools:/app/tools:ro
+      - ../.scratch:/app/.scratch
+    ports: ["8083:8083"]
+    restart: unless-stopped
+
+  solver:
+    build: { context: .., dockerfile: apps/solver/Dockerfile }
+    env_file:
+      - path: .env
+        required: false
+    ports: ["8081:8081"]
+    restart: unless-stopped
+
+  root-auditor:
+    build: { context: .., dockerfile: apps/root-auditor/Dockerfile }
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgres://shade:shade@postgres:5432/shade
+    depends_on:
+      postgres: { condition: service_healthy }
+    ports: ["8084:8084"]
+    restart: unless-stopped
+
+  web:
+    build: { context: .., dockerfile: apps/web/Dockerfile }
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8080
+      NEXT_PUBLIC_PRIVY_APP_ID: ${NEXT_PUBLIC_PRIVY_APP_ID:-}
+    depends_on: [ api ]
+    ports: ["3000:3000"]
+    restart: unless-stopped
+
+volumes:
+  shade-pg:
