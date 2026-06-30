@@ -11,43 +11,51 @@ include "merkleProof.circom";
 // proves BOTH sides of a matched pair so the contract can atomically spend both
 // nullifiers in a single `mpc_settle` call.
 //
+// Hash-function architecture (no mismatch):
+//   - Committee batch hash: SHA-256 over a canonical JSON string (TypeScript code).
+//     This is passed as a PUBLIC input `batchHash`. The contract verifies the
+//     committee threshold Ed25519 signature over this hash independently.
+//   - In-circuit hashes: all Poseidon255 (commitment, nullifier, Merkle proofs,
+//     compliance tree). These NEVER need to match the SHA-256 batch hash.
+//   - Link: both the contract (committee sig check) and this circuit (proof)
+//     expose `batchHash` as a shared public signal. If they differ the contract
+//     rejects. This binds the proof to the committee-approved batch without
+//     requiring a SHA-256 gadget inside the circuit.
+//
 // What the circuit proves:
-//   1. Note A and note B are genuine commitments in the current Merkle tree.
+//   1. Input note A and note B are genuine commitments in the current Merkle tree.
 //   2. Both labels satisfy the protocol's ASP compliance policy.
-//   3. The domain-separated nullifiers are correct.
-//   4. The output commitments are well-formed from the supplied preimages.
-//   5. The matched amount satisfies the trade (matchedAmount ≤ min(valueA, valueB)).
-//   6. The batch hash binds batchId + (intentAId, intentBId, matchedAmount) — the
-//      same pre-image the committee signed. The contract verifies the committee
-//      threshold signature over this hash independently; the circuit enforces the
-//      hash is correctly formed from the match parameters.
+//   3. Domain-separated nullifier hashes are correctly formed.
+//   4. Output commitments are well-formed from supplied preimages.
+//   5. Matched amount satisfies both trades (matchedAmount ≤ min(valueA, valueB)).
+//   6. Value is conserved: outValueA + outValueB == 2 × matchedAmount.
 //
 // Public-signal order (outputs first, then declared `public` inputs):
-//   [0]  nullifierHashA     domain-sep nullifier for note A
-//   [1]  nullifierHashB     domain-sep nullifier for note B
+//   [0]  nullifierHashA     domain-sep nullifier for note A (spent on-chain)
+//   [1]  nullifierHashB     domain-sep nullifier for note B (spent on-chain)
 //   [2]  outputCommitmentA  new note commitment (counterparty B will own this)
 //   [3]  outputCommitmentB  new note commitment (counterparty A will own this)
-//   [4]  batchHashSignal    Poseidon(batchIdField, intentAIdField, intentBIdField, matchedAmount7dp)
-//   [5]  stateRoot          Merkle root; both notes must be leaves
-//   [6]  associationRoot    ASP compliance root; both labels must be members
+//   [4]  stateRoot          Merkle root; both notes must be leaves
+//   [5]  associationRoot    ASP compliance root; both labels must be members
+//   [6]  batchHash          SHA-256 batch hash the committee signed (pass-through)
 //   [7]  poolId             domain separator
 //   [8]  chainId            domain separator
 //   [9]  matchedAmount7dp   amount of the trade (7dp)
 //   [10] deadlineLedger     later of the two intent deadlines
-//   [11] intentAIdField     int(sha256(intentA_id)[:31]) — ties proof to specific intent
-//   [12] intentBIdField     int(sha256(intentB_id)[:31])
 
 template MpcSettlement(treeDepth, associationDepth) {
 
     // ── PUBLIC INPUTS ────────────────────────────────────────────────────────
     signal input stateRoot;
     signal input associationRoot;
+    // batchHash: the SHA-256 batch hash from `computeBatchHash()` in mpc-crypto.
+    // The contract verifies the committee threshold sig over this value and checks
+    // that this proof's batchHash == the one that was signed.
+    signal input batchHash;
     signal input poolId;
     signal input chainId;
     signal input matchedAmount7dp;
     signal input deadlineLedger;
-    signal input intentAIdField;       // [11] int(sha256(intentAId)[:31])
-    signal input intentBIdField;       // [12] int(sha256(intentBId)[:31])
 
     // ── PRIVATE INPUTS — NOTE A (the note being spent by party A) ───────────
     signal input labelA;
@@ -81,30 +89,28 @@ template MpcSettlement(treeDepth, associationDepth) {
     signal input outNullifierB;
     signal input outSecretB;
 
-    // Batch id as a field element (Poseidon domain sep for batch hash).
-    signal input batchIdField;
-
     // ── OUTPUTS ──────────────────────────────────────────────────────────────
     signal output nullifierHashA;       // [0]
     signal output nullifierHashB;       // [1]
     signal output outputCommitmentA;    // [2]
     signal output outputCommitmentB;    // [3]
-    signal output batchHashSignal;      // [4]
 
     // ── 1. Compute input commitments ─────────────────────────────────────────
     component cmtA = CommitmentHasher();
-    cmtA.label    <== labelA;
-    cmtA.value    <== valueA;
-    cmtA.secret   <== secretA;
+    cmtA.label     <== labelA;
+    cmtA.value     <== valueA;
+    cmtA.secret    <== secretA;
     cmtA.nullifier <== nullifierA;
-    signal commitmentA <== cmtA.commitment;
+    signal commitmentA   <== cmtA.commitment;
+    signal _inNhA        <== cmtA.nullifierHash; // unused output consumed
 
     component cmtB = CommitmentHasher();
-    cmtB.label    <== labelB;
-    cmtB.value    <== valueB;
-    cmtB.secret   <== secretB;
+    cmtB.label     <== labelB;
+    cmtB.value     <== valueB;
+    cmtB.secret    <== secretB;
     cmtB.nullifier <== nullifierB;
-    signal commitmentB <== cmtB.commitment;
+    signal commitmentB   <== cmtB.commitment;
+    signal _inNhB        <== cmtB.nullifierHash;
 
     // ── 2. Merkle membership: both notes in state tree ───────────────────────
     component merkleA = MerkleProof(treeDepth);
@@ -147,21 +153,23 @@ template MpcSettlement(treeDepth, associationDepth) {
 
     // ── 5. Output commitments ────────────────────────────────────────────────
     component outCmtA = CommitmentHasher();
-    outCmtA.label    <== outLabelA;
-    outCmtA.value    <== outValueA;
-    outCmtA.secret   <== outSecretA;
+    outCmtA.label     <== outLabelA;
+    outCmtA.value     <== outValueA;
+    outCmtA.secret    <== outSecretA;
     outCmtA.nullifier <== outNullifierA;
     outputCommitmentA <== outCmtA.commitment;
+    signal _outNhA    <== outCmtA.nullifierHash;
 
     component outCmtB = CommitmentHasher();
-    outCmtB.label    <== outLabelB;
-    outCmtB.value    <== outValueB;
-    outCmtB.secret   <== outSecretB;
+    outCmtB.label     <== outLabelB;
+    outCmtB.value     <== outValueB;
+    outCmtB.secret    <== outSecretB;
     outCmtB.nullifier <== outNullifierB;
     outputCommitmentB <== outCmtB.commitment;
+    signal _outNhB    <== outCmtB.nullifierHash;
 
     // ── 6. Match value constraints ───────────────────────────────────────────
-    // matchedAmount ≤ valueA: the difference must be non-negative (128-bit range).
+    // matchedAmount ≤ valueA (difference is non-negative, 128-bit).
     signal remainA <== valueA - matchedAmount7dp;
     component rngA = Num2Bits(128);
     rngA.in <== remainA;
@@ -173,31 +181,19 @@ template MpcSettlement(treeDepth, associationDepth) {
     rngB.in <== remainB;
     _ <== rngB.out;
 
-    // outValueA + outValueB == matchedAmount7dp * 2 (conservation of value).
-    // (Each counterparty receives exactly the matched amount of the other asset.)
-    signal outSum <== outValueA + outValueB;
+    // Value conservation: each party sends matchedAmount to the other.
+    signal outSum      <== outValueA + outValueB;
     signal expectedSum <== matchedAmount7dp * 2;
     outSum === expectedSum;
 
-    // ── 7. Batch hash: ties the proof to the committee-signed batch ───────────
-    // batchHash = Poseidon(batchIdField, intentAIdField, intentBIdField, matchedAmount7dp)
-    // The committee computed the same hash (SHA-256 in TS, translated to a field
-    // element) before signing. The contract verifies the committee threshold sig
-    // over the matching bytes; the circuit enforces the in-circuit Poseidon digest
-    // matches the public batchHashSignal output, binding all match parameters.
-    component bh = Poseidon255(4);
-    bh.in[0] <== batchIdField;
-    bh.in[1] <== intentAIdField;
-    bh.in[2] <== intentBIdField;
-    bh.in[3] <== matchedAmount7dp;
-    batchHashSignal <== bh.out;
-
-    // Bind deadline into constraint system (contract enforces not expired).
-    signal dlBind <== deadlineLedger * deadlineLedger;
+    // ── 7. Bind public inputs into constraint system ─────────────────────────
+    // batchHash is a pass-through public signal (SHA-256, not recomputed here).
+    // The contract checks: committee_sig_verified_over(batchHash) AND proof.batchHash == batchHash.
+    signal bhBind      <== batchHash * batchHash;
+    signal dlBind      <== deadlineLedger * deadlineLedger;
 }
 
 component main {public [
-    stateRoot, associationRoot, poolId, chainId,
-    matchedAmount7dp, deadlineLedger,
-    intentAIdField, intentBIdField
+    stateRoot, associationRoot, batchHash,
+    poolId, chainId, matchedAmount7dp, deadlineLedger
 ]} = MpcSettlement(12, 2);

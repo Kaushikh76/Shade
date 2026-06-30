@@ -1,6 +1,7 @@
 pragma circom 2.2.0;
 
 include "poseidon255.circom";
+include "bitify.circom";
 
 // Shade ProofOfFillClaim circuit.
 //
