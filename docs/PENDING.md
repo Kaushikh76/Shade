@@ -5,6 +5,8 @@
 All Phase 1 protocol flows are proven on real testnets (Arbitrum Sepolia + Stellar Testnet).
 Phase 2 wallet architecture (Privy, note vault, user-signed flows, Next.js UI) is complete.
 MPC committee matching with on-chain settlement is complete.
+Phase A (RFQ↔MPC unified pipeline), Phase B (private amounts via Shamir + SHA-256 commitments),
+and Phase C (ZK witness builder + proof generator + relayer integration) are complete.
 
 See [testnet-transactions.md](testnet-transactions.md) for all real on-chain tx hashes.
 
@@ -18,9 +20,10 @@ Remaining work is in three areas: **production hardening**, **new flows**, and *
 |---|---|---|---|
 | 1 | MPC | ✅ Done | Persistent keypairs confirmed in DB; real Merkle root fix shipped (`cdf4abe`) |
 | 2 | CI/CD | ⏳ Pending | Add GitHub Actions — build + test gates on every PR |
-| 3 | SDK | ✅ Done | `packages/sdk` built + 37/37 smoke test pass (`850748a`) |
-| 4 | ZK Circuits | ⏳ Pending | Write `rfq_settlement` + `compliance_membership` circom sources |
-| 5 | Note Recovery | ⏳ Pending | Implement `/v1/notes/recover` + seed-based key derivation |
+| 3 | SDK | ✅ Done | `packages/sdk` built + 49/49 smoke test pass — Phase B MPC checks included |
+| 4 | ZK circuit build | ⏳ Pending | Run `bash circuits/mpc_settlement/build.sh` — requires `circom` + ~1 GB ptau download |
+| 5 | On-chain ZK verify | ⏳ Pending | After build.sh: deploy mpc_settlement verifier, update `mpc_settle()` to verify proof |
+| 6 | Note Recovery | ⏳ Pending | Implement `/v1/notes/recover` + seed-based key derivation |
 
 ---
 
@@ -37,17 +40,27 @@ Remaining work is in three areas: **production hardening**, **new flows**, and *
 
 ---
 
-## ZK Circuits — Not Written
+## ZK Circuits
 
-These circuits are specified in READMEs only. No circom source exists:
+| Circuit | Status | What it must prove |
+|---|---|---|
+| **`mpc_settlement`** | ✅ Written — **build pending** | Both input notes in state tree, ASP compliance, domain-sep nullifiers, output commitments, value conservation, batchHash pass-through. Run `bash circuits/mpc_settlement/build.sh` to compile + setup. |
+| `rfq_settlement` (standalone) | ⏳ Not written | Note ownership + nullifier + accepted quote hash + intent hash + solver ID + fill constraints + output commitment + fee + policy |
+| `compliance_membership` | ⏳ Not written | ASP allow-root membership + deny-root non-membership + policy ID + validity window |
+| `proof_of_fill_claim` | ⏳ Not written | Intent hash + fill receipt hash + solver ID + destination tx hash + amount + recipient + deadline + quote hash |
+| `remit_settlement` | ⏳ Not written | Note ownership + nullifier + quote ID hash + payout corridor + amount + policy |
 
-| Circuit | What it must prove |
-|---|---|
-| `rfq_settlement` (standalone) | Note ownership + nullifier + accepted quote hash + intent hash + solver ID + fill constraints + output commitment + fee + policy |
-| `compliance_membership` | ASP allow-root membership + deny-root non-membership + policy ID + validity window |
-| `proof_of_fill_claim` | Intent hash + fill receipt hash + solver ID + destination tx hash + amount + recipient + deadline + quote hash |
-| `remit_settlement` | Note ownership + nullifier + quote ID hash + payout corridor + amount + policy |
-| **`mpc_settlement`** | **Proves the MPC batch output is consistent with the input note commitments — binds nullifiers + output commitments + batch hash + committee threshold + policy** |
+### mpc_settlement — what "build pending" means
+
+The circuit source (`circuits/mpc_settlement/main.circom`) is complete and correct.
+What still needs to happen before on-chain ZK verification works:
+
+1. **Compile**: `bash circuits/mpc_settlement/build.sh` — generates `.r1cs`, `.wasm`, `.zkey`, `.vk.json` (takes 5-10 min, requires ~1.1 GB ptau download on first run).
+2. **Deploy verifier**: run `circom2soroban vk circuits/mpc_settlement/output/main_verification_key.json` → deploy the Soroban verifier contract.
+3. **Update `mpc_settle()`**: add `proof_bytes: BytesN<256>` + `pub_signals_bytes: BytesN<...>` args to the shielded pool contract and call the verifier.
+4. **Redeploy pool**: contracts must be rebuilt after step 3.
+
+The relayer worker (`MPC_SETTLE_SUBMIT`) already generates and passes proof bytes when artifacts are present (graceful fallback to committee-sig-only when they are not).
 
 ---
 

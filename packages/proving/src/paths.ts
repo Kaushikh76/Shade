@@ -32,6 +32,9 @@ export function transferCircuitDir(): string {
 export function depositCircuitDir(): string {
   return process.env.DEPOSIT_CIRCUIT_DIR || resolve(CIRCUIT_BUILD_DIR, "deposit_note_mint");
 }
+export function mpcSettlementCircuitDir(): string {
+  return process.env.MPC_SETTLEMENT_CIRCUIT_DIR || resolve(CIRCUIT_BUILD_DIR, "mpc_settlement");
+}
 
 let scratchEnsured = false;
 export function scratchDir(): string {

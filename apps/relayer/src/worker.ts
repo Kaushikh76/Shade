@@ -207,10 +207,11 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
   }
 
   if (job.job_type === "MPC_SETTLE_SUBMIT") {
-    // Phase 8: MPC committee-matched settlement.
+    // Phase 8 + Phase C: MPC committee-matched settlement.
     // 1. Verify threshold Ed25519 committee signatures over batchHash.
-    // 2. Attempt pool.mpc_settle on-chain (spends both nullifiers, inserts output commitments).
-    // 3. If contract not yet deployed, record as off-chain-validated and proceed.
+    // 2. Attempt ZK proof generation (MpcCircuitNotBuiltError → graceful fallback).
+    // 3. Attempt pool.mpc_settle on-chain (spends both nullifiers, inserts output commitments).
+    // 4. If contract not yet deployed, record as off-chain-validated and proceed.
     const { verifySignedBatch } = await import("@shade/mpc-crypto");
 
     const sigs = p.signatures as Array<{ nodeId: string; signingPubkey: string; signature: string }>;
@@ -269,6 +270,76 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
     if (!valid) throw new Error(`MPC batch ${p.batchId}: signature verification failed (${sigs.length} sigs, need ≥2/3)`);
     await queue.setStatus(job.job_id, "verified_signatures", `batch ${p.batchId} — ${sigs.length} committee sigs valid`);
 
+    // Phase C: attempt ZK proof generation for the matched pair.
+    // MpcCircuitNotBuiltError is expected until `bash circuits/mpc_settlement/build.sh`
+    // is run; in that case we fall back to committee-signature-only settlement.
+    let zkProofHex: string | null = null;
+    let zkPublicHex: string | null = null;
+    let zkVerified = false;
+
+    const coinAPath = p.coinAPath as string | undefined;
+    const coinBPath = p.coinBPath as string | undefined;
+    const assocPath = p.assocPath as string | undefined;
+
+    if (coinAPath && coinBPath && assocPath) {
+      try {
+        await queue.setStatus(job.job_id, "proving", `generating mpc_settlement ZK proof for batch ${p.batchId}`);
+        const {
+          buildMpcSettlementProof, MpcCircuitNotBuiltError,
+          scratchDir
+        } = await import("@shade/proving");
+
+        const scratch = process.env.SHADE_SCRATCH_DIR ?? scratchDir();
+        const tag = `mpc_${String(p.batchId).slice(0, 8)}_${Date.now()}`;
+
+        const coinFile = (path: string) => {
+          const raw = JSON.parse(readFileSync(path, "utf8"));
+          return { path, commitmentHex: raw.commitment_hex as string, commitmentDecimal: raw.coin.commitment as string, value7dp: raw.coin.value as string };
+        };
+
+        // Fetch pool commitments for Merkle proof generation.
+        let commitmentsDecimal: string[] = [];
+        try {
+          const { rows } = await queue.query<{ commitment: string }>(
+            "SELECT commitment FROM note_commitments WHERE leaf_index IS NOT NULL ORDER BY leaf_index ASC"
+          );
+          commitmentsDecimal = rows.map(r =>
+            BigInt(r.commitment.startsWith("0x") ? r.commitment : "0x" + r.commitment).toString()
+          );
+        } catch { /* DB unavailable */ }
+
+        const proof = buildMpcSettlementProof({
+          coinA: coinFile(coinAPath),
+          coinB: coinFile(coinBPath),
+          commitmentsDecimal,
+          assocPath,
+          scope: String(p.scope ?? env.POOL_SCOPE ?? "shade-pool-testnet-v1"),
+          batchHashHex: String(p.batchHash),
+          poolId: String(p.poolId ?? "0"),
+          chainId: String(p.chainId ?? "27"), // Stellar CCTP domain
+          matchedAmount7dp: String(p.matchedAmount7dp),
+          deadlineLedger: String(p.deadlineLedger ?? "0"),
+          scratch,
+          tag
+        });
+
+        zkProofHex  = proof.proofHex;
+        zkPublicHex = proof.publicHex;
+        zkVerified  = proof.locallyVerified;
+
+        await queue.setStatus(
+          job.job_id, "proof_ready",
+          `ZK proof generated — locally verified: ${zkVerified}, nullifierA: ${proof.nullifierHashAHex.slice(0, 10)}…`
+        );
+      } catch (err) {
+        if ((err as Error).name === "MpcCircuitNotBuiltError") {
+          console.info(`[relayer] mpc_settlement circuit not built — skipping ZK proof for batch ${p.batchId}. Run: bash circuits/mpc_settlement/build.sh`);
+        } else {
+          console.warn(`[relayer] ZK proof generation failed for batch ${p.batchId}: ${(err as Error).message}`);
+        }
+      }
+    }
+
     // Extract note data from job payload (populated by settler from mpc_intents table).
     const nullifierA  = p.nullifierA  as string | null;
     const nullifierB  = p.nullifierB  as string | null;
@@ -296,6 +367,11 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
         const pubkeysJson = JSON.stringify(sigs.map(s => stripHex(s.signingPubkey)));
         const sigsJson    = JSON.stringify(sigs.map(s => stripHex(s.signature)));
 
+        // Include ZK proof args when proof generation succeeded.
+        const proofArgs = zkProofHex && zkPublicHex
+          ? ["--proof_bytes", zkProofHex, "--pub_signals_bytes", zkPublicHex]
+          : [];
+
         const r = sorobanInvoke({
           contractId: poolContract, secret: env.STELLAR_RELAYER_SECRET,
           method: "mpc_settle", rpcUrl: RPC, passphrase: PASS, retries: 3,
@@ -308,6 +384,7 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
             "--batch_hash",          hash32,
             "--signer_pubkeys",      pubkeysJson,
             "--signatures",          sigsJson,
+            ...proofArgs
           ]
         });
         return {
@@ -315,7 +392,10 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
           batchId: p.batchId, matchIndex: p.matchIndex,
           txHash: r.txHash,
           nullifierA, nullifierB,
-          note: "pool.mpc_settle confirmed on Stellar testnet"
+          zkProof: zkProofHex ? { generated: true, verified: zkVerified } : { generated: false },
+          note: zkProofHex
+            ? `pool.mpc_settle confirmed with ZK proof (verified=${zkVerified})`
+            : "pool.mpc_settle confirmed (committee sigs only — compile circuit for ZK proof)"
         };
       } catch (err) {
         // mpc_settle invocation failed — log error, fall through to off-chain result.
@@ -330,6 +410,7 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
       matchedAmount7dp: p.matchedAmount7dp,
       nullifierA, nullifierB, outCommitA, outCommitB,
       missingNote,
+      zkProof: zkProofHex ? { generated: true, verified: zkVerified } : { generated: false },
       note: missingNote
         ? "note data missing from DB — intent not submitted through API"
         : "committee sigs verified off-chain; mpc_settle call failed (check relayer logs)"
