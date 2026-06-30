@@ -52,8 +52,8 @@ async function main() {
   generated.ARB_SEPOLIA_USDC_ADDRESS = process.env.ARB_SEPOLIA_USDC_ADDRESS ?? LOCKED_CCTP.arbitrumSepoliaUsdc;
   generated.ARB_SEPOLIA_CCTP_DOMAIN = String(LOCKED_CCTP.arbitrumSepoliaDomain);
   generated.STELLAR_CCTP_DOMAIN = String(LOCKED_CCTP.stellarDomain);
-  generated.STELLAR_CCTP_FORWARDER_CONTRACT = process.env.STELLAR_CCTP_FORWARDER_CONTRACT ?? LOCKED_CCTP.stellarCctpForwarder;
-  generated.STELLAR_CCTP_MESSAGE_TRANSMITTER_CONTRACT = process.env.STELLAR_CCTP_MESSAGE_TRANSMITTER_CONTRACT ?? LOCKED_CCTP.stellarMessageTransmitter;
+  generated.STELLAR_CCTP_FORWARDER_CONTRACT = process.env.STELLAR_CCTP_FORWARDER_CONTRACT || LOCKED_CCTP.stellarCctpForwarder;
+  generated.STELLAR_CCTP_MESSAGE_TRANSMITTER_CONTRACT = process.env.STELLAR_CCTP_MESSAGE_TRANSMITTER_CONTRACT || LOCKED_CCTP.stellarMessageTransmitter;
 
   await writeEnvGenerated(generated);
 
@@ -72,6 +72,7 @@ async function loadGenerated(): Promise<EnvMap> {
   return Object.fromEntries(
     text
       .split("\n")
+      .map((line) => line.replace(/\r$/, ""))
       .filter((line) => line.includes("=") && !line.trim().startsWith("#"))
       .map((line) => {
         const index = line.indexOf("=");

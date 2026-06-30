@@ -3,7 +3,7 @@ import { loadRuntimeEnv, requireKeys } from "./lib/env.js";
 import { failIfAny, writeCheckReport, type CheckResult } from "./lib/report.js";
 import { runCctpInbound } from "./lib/cctp-inbound.js";
 import { sorobanInvoke, createTrustline, bytesToCliHex } from "@shade/stellar-utils";
-import { generateCoin, buildNoteProof, computeStateRoot, buildAssociationSet, hexRoot, recipientHashField } from "./lib/prove.js";
+import { generateCoin, buildNoteProof, buildDepositProof, computeStateRoot, buildAssociationSet, hexRoot, recipientHashField } from "./lib/prove.js";
 import { LOCKED_CCTP } from "@shade/cctp-utils";
 
 import { scratchDir } from "./lib/paths.js";
@@ -19,6 +19,8 @@ const pool = env.SHIELDED_POOL_CONTRACT;
 const userSecret = env.STELLAR_USER_SECRET;
 const userPub = env.STELLAR_USER_PUBLIC;
 const relayerSecret = env.STELLAR_RELAYER_SECRET;
+// Pool was deployed with deployer as admin; admin-only pool calls use deployer secret.
+const poolAdminSecret = env.STELLAR_DEPLOYER_SECRET ?? relayerSecret;
 const sac = env.STELLAR_TESTNET_USDC_SAC_CONTRACT!;
 const rpc = env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const pass = env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
@@ -46,7 +48,7 @@ results.push({ name: "#1 anonymity set built", ok: leafSet.length > 1, detail: `
 
 // #4 association set containing the real note's label; set it on-chain as the ASP root.
 const assoc = buildAssociationSet(realCoin, SCRATCH, "zkw");
-sorobanInvoke({ contractId: pool, secret: relayerSecret, method: "set_association_root", args: ["--association_root", bytesToCliHex(assoc.rootHex)], rpcUrl: rpc, passphrase: pass });
+sorobanInvoke({ contractId: pool, secret: poolAdminSecret, method: "set_association_root", args: ["--association_root", bytesToCliHex(assoc.rootHex)], rpcUrl: rpc, passphrase: pass });
 results.push({ name: "#4 ASP association root set on-chain", ok: true, detail: assoc.rootHex.slice(0, 18) + "..." });
 
 // 2) Fund the pool with the REAL note via CCTP (root after [real]).
@@ -62,25 +64,51 @@ const inbound = await runCctpInbound(env, {
   targetContract: pool,
   newRootHex: rootAfterReal,
   coin: realCoin,
-  scratch: SCRATCH
+  scratch: SCRATCH,
+  adminSecret: poolAdminSecret
 });
 results.push({ name: "CCTP fund pool (real note)", ok: true, detail: `${inbound.burnTxHash.slice(0, 14)}... leaf ${inbound.leafIndex}` });
 
-// 3) Register decoy commitments (admin) to grow the tree; each updates the root.
+// 3) Register decoy commitments to grow the tree; each needs a full DepositNoteMint proof.
+//    Decoys use synthetic CCTP params (no real USDC) — valid proofs for the circuit,
+//    and we only ever withdraw the REAL note so no USDC shortfall is triggered.
+const decoyPolicyHex = "0x" + createHash("sha256").update("shade:decoy-policy:v1").digest("hex").slice(0, 64);
+const decoyBurnTx = "0x" + createHash("sha256").update("decoy-burn-placeholder").digest("hex");
 for (let i = 0; i < decoys.length; i++) {
   const prefix = leafSet.slice(0, i + 2); // [real, d0..di]
   const root = computeStateRoot(realCoin, prefix, "shade_pool", SCRATCH, `zkw_r${i + 1}`);
   const nonce = "0x" + createHash("sha256").update(`decoy:${i}:${decoys[i].commitmentHex}`).digest("hex");
+  const encPayloadHash = "0x" + createHash("sha256").update(`decoy-enc:${i}`).digest("hex");
+  // amount7dp must match coin.value7dp (circuit enforces value <= amount7dp);
+  // derive amount6dp as ceil(amount7dp / 10) so amount6dp*10 >= amount7dp.
+  const decoyAmount7 = decoys[i].value7dp;
+  const decoyAmount6 = String(Math.ceil(Number(decoyAmount7) / 10));
+  const dep = buildDepositProof(decoys[i], {
+    sourceDomain: String(LOCKED_CCTP.arbitrumSepoliaDomain),
+    destinationDomain: String(LOCKED_CCTP.stellarDomain),
+    cctpNonceHex: nonce,
+    burnTxHashHex: decoyBurnTx,
+    amount6dp: decoyAmount6,
+    amount7dp: decoyAmount7,
+    assetStrkey: sac,
+    poolStrkey: pool,
+    encryptedNotePayloadHashHex: encPayloadHash,
+    policyIdHex: decoyPolicyHex,
+    poolId: process.env.SHADE_POOL_ID ?? "1",
+    chainId: process.env.SHADE_CHAIN_ID ?? "148"
+  }, SCRATCH, `zkw_decoy${i}`);
   sorobanInvoke({
-    contractId: pool, secret: relayerSecret, method: "receive_cctp_deposit",
+    contractId: pool, secret: poolAdminSecret, method: "receive_cctp_deposit",
     args: [
       "--source_domain", String(LOCKED_CCTP.arbitrumSepoliaDomain),
       "--cctp_nonce", bytesToCliHex(nonce),
-      "--asset", sac, "--amount", "1",
+      "--asset", sac, "--amount", decoyAmount7,
       "--commitment", bytesToCliHex(decoys[i].commitmentHex),
       "--new_root", bytesToCliHex(root),
-      "--encrypted_note_payload_hash", bytesToCliHex(nonce),
-      "--policy_id", bytesToCliHex(nonce)
+      "--encrypted_note_payload_hash", bytesToCliHex(encPayloadHash),
+      "--policy_id", bytesToCliHex(decoyPolicyHex),
+      "--proof_bytes", dep.proofHex,
+      "--pub_signals_bytes", dep.publicHex
     ],
     rpcUrl: rpc, passphrase: pass
   });

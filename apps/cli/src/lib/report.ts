@@ -23,7 +23,8 @@ function gitCommit(): string {
 function contractFingerprint(): string[] {
   if (!existsSync(".env.generated")) return [];
   const lines: string[] = [];
-  for (const line of readFileSync(".env.generated", "utf8").split("\n")) {
+  for (const raw of readFileSync(".env.generated", "utf8").split("\n")) {
+    const line = raw.replace(/\r$/, "");
     const m = line.match(/^([A-Z0-9_]*(CONTRACT|POOL|VERIFIER|REGISTRY|SAC|FORWARDER|MESSENGER))=([A-Z0-9]{56})$/);
     if (m) lines.push(`  - ${m[1]}: ${m[3]}`);
   }

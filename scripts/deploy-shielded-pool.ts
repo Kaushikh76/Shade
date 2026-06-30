@@ -52,14 +52,14 @@ const depositV = deployVerifier("VERIFIER_DEPOSIT_NOTE_MINT_CONTRACT", "deposit_
 const redeployPool = process.env.SHADE_REDEPLOY_POOL === "1" || !env.SHIELDED_POOL_CONTRACT;
 if (redeployPool) {
   const pool = deploy(resolve(WASM_DIR, "shielded_pool.wasm"),
-    ["--admin", relayerPub, "--usdc_sac", usdc, "--verifier", withdrawV, "--nullifier_registry", nullreg,
+    ["--admin", deployerPub, "--usdc_sac", usdc, "--verifier", withdrawV, "--nullifier_registry", nullreg,
      "--depth", "12", "--pool_id", POOL_ID, "--chain_id", CHAIN_ID], deployer);
   env.SHIELDED_POOL_CONTRACT = pool; writeEnv(); console.log(`SHIELDED_POOL_CONTRACT: ${pool}`);
   // Wire the pool.
   invoke(deployer, nullreg, ["set_authorized_spender", "--spender", pool, "--allowed", "true"]);
-  invoke(relayer, pool, ["set_cctp_messenger", "--token_messenger_minter", TMM]);
-  invoke(relayer, pool, ["set_transfer_verifier", "--verifier", transferV]);
-  invoke(relayer, pool, ["set_deposit_verifier", "--verifier", depositV]);
+  invoke(deployer, pool, ["set_cctp_messenger", "--token_messenger_minter", TMM]);
+  invoke(deployer, pool, ["set_transfer_verifier", "--verifier", transferV]);
+  invoke(deployer, pool, ["set_deposit_verifier", "--verifier", depositV]);
   console.log("pool wired: spender, cctp_messenger, transfer_verifier, deposit_verifier");
 } else {
   console.log(`SHIELDED_POOL_CONTRACT: reuse ${env.SHIELDED_POOL_CONTRACT} (set SHADE_REDEPLOY_POOL=1 to redeploy)`);
@@ -96,12 +96,12 @@ function sleep(ms: number) { Atomics.wait(new Int32Array(new SharedArrayBuffer(4
 function req(e: EnvMap, k: string): string { if (!e[k]) throw new Error(`${k} required in .env.generated`); return e[k]; }
 function loadEnv(p: string): EnvMap {
   const e: EnvMap = { ...process.env } as EnvMap;
-  if (existsSync(p)) for (const l of readFileSync(p, "utf8").split("\n")) { if (l.includes("=") && !l.trimStart().startsWith("#")) { const i = l.indexOf("="); e[l.slice(0, i)] = l.slice(i + 1); } }
+  if (existsSync(p)) for (const raw of readFileSync(p, "utf8").split("\n")) { const l = raw.replace(/\r$/, ""); if (l.includes("=") && !l.trimStart().startsWith("#")) { const i = l.indexOf("="); e[l.slice(0, i)] = l.slice(i + 1); } }
   return e;
 }
 function writeEnv() {
   const onlyGenerated: EnvMap = {};
-  if (existsSync(".env.generated")) for (const l of readFileSync(".env.generated", "utf8").split("\n")) { if (l.includes("=") && !l.trimStart().startsWith("#")) { const i = l.indexOf("="); onlyGenerated[l.slice(0, i)] = l.slice(i + 1); } }
+  if (existsSync(".env.generated")) for (const raw of readFileSync(".env.generated", "utf8").split("\n")) { const l = raw.replace(/\r$/, ""); if (l.includes("=") && !l.trimStart().startsWith("#")) { const i = l.indexOf("="); onlyGenerated[l.slice(0, i)] = l.slice(i + 1); } }
   for (const k of ["VERIFIER_WITHDRAW_CONTRACT", "TRANSFER_VERIFIER_CONTRACT", "VERIFIER_DEPOSIT_NOTE_MINT_CONTRACT", "SHIELDED_POOL_CONTRACT"]) if (env[k]) onlyGenerated[k] = env[k];
   const text = Object.entries(onlyGenerated).filter(([k]) => !k.includes(" ")).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k}=${v}`).join("\n");
   writeFileSync(".env.generated", `${text}\n`, { mode: 0o600 }); chmodSync(".env.generated", 0o600);

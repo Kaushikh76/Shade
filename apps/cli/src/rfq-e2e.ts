@@ -29,6 +29,7 @@ const pool = env.SHIELDED_POOL_CONTRACT;
 const rpc = env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const pass = env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
 const relayerSecret = env.STELLAR_RELAYER_SECRET;
+const poolAdminSecret = env.STELLAR_DEPLOYER_SECRET ?? relayerSecret;
 const solverStellarSecret = env.STELLAR_SOLVER_SECRET;
 const solverStellarPub = env.STELLAR_SOLVER_PUBLIC;
 const poolRead = (m: string) => sorobanInvoke({ contractId: pool, secret: relayerSecret, method: m, rpcUrl: rpc, passphrase: pass, readOnly: true }).returnValue.replace(/"/g, "").trim();
@@ -53,7 +54,7 @@ try {
 const coin = generateCoin("shade_rfq", `${SCRATCH}/rfq_coin.json`);
 mark("INTENT_CREATED", `note value ${coin.value7dp} (7dp)`);
 const assoc = buildAssociationSet(coin, SCRATCH, "rfq");
-sorobanInvoke({ contractId: pool, secret: relayerSecret, method: "set_association_root", args: ["--association_root", assoc.rootHex.slice(2)], rpcUrl: rpc, passphrase: pass });
+sorobanInvoke({ contractId: pool, secret: poolAdminSecret, method: "set_association_root", args: ["--association_root", assoc.rootHex.slice(2)], rpcUrl: rpc, passphrase: pass });
 const rfqRoot = computeStateRoot(coin, [coin.commitmentDecimal], "shade_rfq", SCRATCH, "rfq");
 const inbound = await runCctpInbound(env, {
   amount6: BigInt(process.env.RFQ_AMOUNT_6DP ?? "1000000"),
@@ -64,7 +65,8 @@ const inbound = await runCctpInbound(env, {
   targetContract: pool,
   newRootHex: rfqRoot,
   coin,
-  scratch: SCRATCH
+  scratch: SCRATCH,
+  adminSecret: poolAdminSecret
 });
 results.push({ name: "user note funded+registered (CCTP)", ok: true, detail: `burn ${inbound.burnTxHash.slice(0, 14)}..., leaf ${inbound.leafIndex}` });
 const onchainRoot = poolRead("get_root");
@@ -116,7 +118,7 @@ results.push({ name: "solver signed quote (ed25519)", ok: sig.sig.length === 128
 
 // C4: solver onboarding — the pool admin authorizes the solver's ed25519 pubkey.
 // rfq_settle rejects quotes signed by any non-authorized key (#23 UnauthorizedSolver).
-sorobanInvoke({ contractId: pool, secret: relayerSecret, method: "set_authorized_solver",
+sorobanInvoke({ contractId: pool, secret: poolAdminSecret, method: "set_authorized_solver",
   args: ["--solver_pubkey", sig.pubkey, "--allowed", "true"], rpcUrl: rpc, passphrase: pass });
 results.push({ name: "C4 solver pubkey authorized on-chain (registry)", ok: true, detail: `solver ${sig.pubkey.slice(0, 12)}... allowed` });
 

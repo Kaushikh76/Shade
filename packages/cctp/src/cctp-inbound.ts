@@ -28,6 +28,7 @@ export type InboundParams = {
   scratch?: string; // scratch dir for P1.8 deposit proof artifacts
   poolId?: string; // P1.8 domain separator (default "1")
   chainId?: string; // P1.8 domain separator (default "148")
+  adminSecret?: string; // secret key authorized to call receive_cctp_deposit (pool admin); defaults to relayerSecret
 };
 
 export type InboundResult = {
@@ -199,7 +200,7 @@ export async function runCctpInbound(env: EnvMap, p: InboundParams): Promise<Inb
   ];
   const receive = sorobanInvoke({
     contractId: vault,
-    secret: relayerSecret,
+    secret: p.adminSecret ?? relayerSecret,
     method: "receive_cctp_deposit",
     args: receiveArgs,
     rpcUrl: env.STELLAR_RPC_URL,

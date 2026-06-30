@@ -57,7 +57,8 @@ async function loadGenerated(): Promise<Record<string, string>> {
   if (!existsSync(".env.generated")) return {};
   const text = await readFile(".env.generated", "utf8");
   const out: Record<string, string> = {};
-  for (const line of text.split("\n")) {
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/\r$/, "");
     if (!line.includes("=") || line.trimStart().startsWith("#")) continue;
     const index = line.indexOf("=");
     out[line.slice(0, index)] = line.slice(index + 1);

@@ -21,6 +21,7 @@ if (missing.length) { await writeCheckReport("PrivateTransfer E2E", results); fa
 
 const pool = env.SHIELDED_POOL_CONTRACT;
 const relayerSecret = env.STELLAR_RELAYER_SECRET;
+const poolAdminSecret = env.STELLAR_DEPLOYER_SECRET ?? relayerSecret;
 const rpc = env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const pass = env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
 const poolRead = (m: string) => { for (let i = 0; i < 4; i++) { const v = sorobanInvoke({ contractId: pool, secret: relayerSecret, method: m, rpcUrl: rpc, passphrase: pass, readOnly: true }).returnValue.replace(/"/g, "").trim(); if (v !== "") return v; } return "0"; };
@@ -39,7 +40,8 @@ const inbound = await runCctpInbound(env, {
   targetContract: pool,
   newRootHex: rootAfter,
   coin,
-  scratch: SCRATCH
+  scratch: SCRATCH,
+  adminSecret: poolAdminSecret
 });
 results.push({ name: "input note funded (CCTP)", ok: true, detail: `leaf ${inbound.leafIndex}` });
 
@@ -59,7 +61,7 @@ const outRoot = computeStateRoot(coin, leavesAfter, "shade_xfer", SCRATCH, "pt_o
 // 4) Settle the transfer on-chain: verify + spend input nullifier + insert output commitment.
 sleepSync(4000);
 const settle = sorobanInvoke({
-  contractId: pool, secret: relayerSecret, method: "private_transfer_settle",
+  contractId: pool, secret: poolAdminSecret, method: "private_transfer_settle",
   args: ["--proof_bytes", xfer.proofHex, "--pub_signals_bytes", xfer.publicHex, "--new_root", bytesToCliHex(outRoot)],
   rpcUrl: rpc, passphrase: pass, retries: 3
 });
@@ -70,7 +72,7 @@ results.push({ name: "on-chain transfer settle (verify + nullifier + output comm
 sleepSync(12000);
 let dsRejected = false;
 try {
-  sorobanInvoke({ contractId: pool, secret: relayerSecret, method: "private_transfer_settle", args: ["--proof_bytes", xfer.proofHex, "--pub_signals_bytes", xfer.publicHex, "--new_root", bytesToCliHex(outRoot)], rpcUrl: rpc, passphrase: pass, retries: 1 });
+  sorobanInvoke({ contractId: pool, secret: poolAdminSecret, method: "private_transfer_settle", args: ["--proof_bytes", xfer.proofHex, "--pub_signals_bytes", xfer.publicHex, "--new_root", bytesToCliHex(outRoot)], rpcUrl: rpc, passphrase: pass, retries: 1 });
 } catch { dsRejected = true; }
 results.push({ name: "transfer double-spend prevented", ok: dsRejected, detail: dsRejected ? "second settle rejected (input nullifier spent)" : "NOT rejected!" });
 

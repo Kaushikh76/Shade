@@ -47,7 +47,8 @@ async function loadEnv(path: string): Promise<EnvMap> {
   if (!existsSync(path)) return {};
   const text = await readFile(path, "utf8");
   const env: EnvMap = {};
-  for (const line of text.split("\n")) {
+  for (const raw of text.split("\n")) {
+    const line = raw.replace(/\r$/, "");
     if (!line.includes("=") || line.trimStart().startsWith("#")) continue;
     const index = line.indexOf("=");
     env[line.slice(0, index)] = line.slice(index + 1);

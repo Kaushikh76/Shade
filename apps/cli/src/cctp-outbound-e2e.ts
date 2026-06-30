@@ -21,6 +21,7 @@ const pool = env.SHIELDED_POOL_CONTRACT;
 const rpc = env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const pass = env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
 const relayerSecret = env.STELLAR_RELAYER_SECRET;
+const poolAdminSecret = env.STELLAR_DEPLOYER_SECRET ?? relayerSecret;
 const userSecret = env.STELLAR_USER_SECRET;
 const apiBase = env.CCTP_ATTESTATION_API_BASE ?? "https://iris-api-sandbox.circle.com";
 const poolRead = (m: string) => sorobanInvoke({ contractId: pool, secret: relayerSecret, method: m, rpcUrl: rpc, passphrase: pass, readOnly: true }).returnValue.replace(/"/g, "").trim();
@@ -33,7 +34,7 @@ const recipient32 = "0x" + "00".repeat(12) + getAddress(userArb).slice(2).toLowe
 const coin = generateCoin("shade_exit", `${SCRATCH}/exit_coin.json`);
 console.log(`Outbound: funding note (${coin.value7dp} 7dp), then proof-bound CCTP exit to ${userArb}...`);
 const assoc = buildAssociationSet(coin, SCRATCH, "exit");
-sorobanInvoke({ contractId: pool, secret: relayerSecret, method: "set_association_root", args: ["--association_root", assoc.rootHex.slice(2)], rpcUrl: rpc, passphrase: pass });
+sorobanInvoke({ contractId: pool, secret: poolAdminSecret, method: "set_association_root", args: ["--association_root", assoc.rootHex.slice(2)], rpcUrl: rpc, passphrase: pass });
 const exitRoot = computeStateRoot(coin, [coin.commitmentDecimal], "shade_exit", SCRATCH, "exit");
 const inbound = await runCctpInbound(env, {
   amount6: BigInt(process.env.EXIT_AMOUNT_6DP ?? "1000000"),
@@ -44,7 +45,8 @@ const inbound = await runCctpInbound(env, {
   targetContract: pool,
   newRootHex: exitRoot,
   coin,
-  scratch: SCRATCH
+  scratch: SCRATCH,
+  adminSecret: poolAdminSecret
 });
 results.push({ name: "note funded into pool (CCTP inbound)", ok: true, detail: `leaf ${inbound.leafIndex}` });
 const onchainRoot = poolRead("get_root");

@@ -11,7 +11,8 @@ type EnvMap = Record<string, string>;
 function loadRuntimeEnv(): EnvMap {
   const env: EnvMap = { ...process.env } as EnvMap;
   if (existsSync(".env.generated")) {
-    for (const line of readFileSync(".env.generated", "utf8").split("\n")) {
+    for (const raw of readFileSync(".env.generated", "utf8").split("\n")) {
+      const line = raw.replace(/\r$/, "");
       if (!line.includes("=") || line.trimStart().startsWith("#")) continue;
       const i = line.indexOf("=");
       env[line.slice(0, i)] = line.slice(i + 1);

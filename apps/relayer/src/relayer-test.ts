@@ -11,7 +11,8 @@ function loadEnv(): Record<string, string> {
   const env: Record<string, string> = { ...process.env } as Record<string, string>;
   for (const [path, override] of [["../.env", false], [".env", false], [".env.generated", true]] as const) {
     if (!existsSync(path)) continue;
-    for (const line of readFileSync(path, "utf8").split("\n")) {
+    for (const raw of readFileSync(path, "utf8").split("\n")) {
+      const line = raw.replace(/\r$/, "");
       if (!line.includes("=") || line.trimStart().startsWith("#")) continue;
       const i = line.indexOf("=");
       const k = line.slice(0, i);
