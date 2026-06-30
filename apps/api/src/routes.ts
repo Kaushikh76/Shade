@@ -97,7 +97,7 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   app.get("/v1/health/full", async () => {
     let db = false;
     try { await store.health(); db = true; } catch { /* down */ }
-    return { ok: db, db, pool: process.env.SHIELDED_POOL_CONTRACT ?? null, network: process.env.STELLAR_NETWORK_PASSPHRASE ?? "testnet" };
+    return { ok: db, db, pool: process.env.SHIELDED_POOL_CONTRACT || null, network: process.env.STELLAR_NETWORK_PASSPHRASE ?? "testnet" };
   });
 
   // ---- Authentication (wallet-signature) ----
@@ -249,10 +249,10 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
 
     const amount6 = BigInt(body.amount_usdc_6dp);
     const amount7Max = usdc6ToStellar7(amount6);
-    const usdcAddress = process.env.ARB_SEPOLIA_USDC_ADDRESS ?? LOCKED_CCTP.arbitrumSepoliaUsdc;
-    const tokenMessenger = process.env.ARB_SEPOLIA_CCTP_TOKEN_MESSENGER ?? LOCKED_CCTP.arbitrumSepoliaTokenMessenger;
-    const forwarder = process.env.STELLAR_CCTP_FORWARDER_CONTRACT ?? LOCKED_CCTP.stellarCctpForwarder;
-    const pool = process.env.SHIELDED_POOL_CONTRACT ?? "";
+    const usdcAddress = process.env.ARB_SEPOLIA_USDC_ADDRESS || LOCKED_CCTP.arbitrumSepoliaUsdc;
+    const tokenMessenger = process.env.ARB_SEPOLIA_CCTP_TOKEN_MESSENGER || LOCKED_CCTP.arbitrumSepoliaTokenMessenger;
+    const forwarder = process.env.STELLAR_CCTP_FORWARDER_CONTRACT || LOCKED_CCTP.stellarCctpForwarder;
+    const pool = process.env.SHIELDED_POOL_CONTRACT || "";
     const mintRecipient = stellarContractToBytes32(forwarder);
     const destinationCaller = stellarContractToBytes32(forwarder);
     const hookData = encodeStellarForwardHook(pool);

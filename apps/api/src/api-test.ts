@@ -84,7 +84,7 @@ try {
     if (j && (j.status === "ready" || j.status === "failed")) break;
     if (!(await runProverOnce(queue))) break;
   }
-  const jobView = json(await app.inject({ method: "GET", url: `/v1/jobs/${post.job_id}` }));
+  const jobView = json(await app.inject({ method: "GET", url: `/v1/jobs/${post.job_id}`, headers: authH }));
   check("job reaches ready with proof bytes", jobView.status === "ready" && typeof (jobView.result as { proofHex?: string })?.proofHex === "string", `status=${jobView.status}`);
 
   // --- RFQ lifecycle: intent -> quote -> accept -> lock -> fill (authenticated) ---

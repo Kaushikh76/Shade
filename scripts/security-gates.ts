@@ -7,8 +7,10 @@ import { execSync } from "node:child_process";
 type Gate = { name: string; cmd: string; allow?: RegExp };
 const ROOT = process.env.SHADE_ROOT ?? process.cwd();
 
+// On Windows, cmd.exe lacks grep/awk; use bash (available via Git for Windows).
+const SHELL = process.platform === "win32" ? "bash" : "/bin/sh";
 function run(cmd: string): string[] {
-  try { return execSync(cmd, { cwd: ROOT, encoding: "utf8" }).split("\n").filter(Boolean); }
+  try { return execSync(cmd, { cwd: ROOT, encoding: "utf8", shell: SHELL }).split("\n").filter(Boolean); }
   catch { return []; } // grep exits 1 on no match
 }
 

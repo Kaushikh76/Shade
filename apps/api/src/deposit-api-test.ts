@@ -2,7 +2,7 @@ import "dotenv/config";
 process.env.PRIVY_APP_ID = "test-deposit-app";
 process.env.SHADE_NETWORK_MODE = "testnet";
 // Deposit calldata needs the canonical pool id (public, not a secret).
-process.env.SHIELDED_POOL_CONTRACT = process.env.SHIELDED_POOL_CONTRACT ?? "CDVEGBVXPIHKHCR7CJDJS4JVCMOVABEFBQ4HZQ7PKK6VIO3J3V5ZRTB5";
+process.env.SHIELDED_POOL_CONTRACT = process.env.SHIELDED_POOL_CONTRACT || "CDVEGBVXPIHKHCR7CJDJS4JVCMOVABEFBQ4HZQ7PKK6VIO3J3V5ZRTB5";
 import Fastify from "fastify";
 import { Wallet } from "ethers";
 import { registerRoutes } from "./routes.js";

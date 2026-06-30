@@ -1,8 +1,17 @@
 import { execFileSync } from "node:child_process";
-import { writeFileSync, readFileSync } from "node:fs";
+import { writeFileSync, readFileSync, rmSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { resolve } from "node:path";
 
-import { COINUTILS_BIN, CIRCOM2SOROBAN_BIN, withdrawCircuitDir, transferCircuitDir, depositCircuitDir } from "./paths.js";
+import { SHADE_ROOT, COINUTILS_BIN, CIRCOM2SOROBAN_BIN, withdrawCircuitDir, transferCircuitDir, depositCircuitDir } from "./paths.js";
+
+// Invoke snarkjs via the Node binary rather than relying on a global PATH entry.
+// On Windows, node_modules/.bin/snarkjs is a .cmd shim that execFileSync can't
+// run without shell:true; using node + cli.js is cross-platform and avoids PATH.
+const SNARKJS_CLI = resolve(SHADE_ROOT, "node_modules/snarkjs/cli.js");
+function snarkjs(args: string[], opts: { cwd?: string; timeout?: number } = {}): string {
+  return execFileSync(process.execPath, [SNARKJS_CLI, ...args], { encoding: "utf8", ...opts });
+}
 
 export const COINUTILS = COINUTILS_BIN;
 // Shade's own corrected withdraw circuit (commitment = Poseidon(value,label,precommit),
@@ -33,8 +42,7 @@ export function generateCoin(scope: string, outPath: string): GeneratedCoin {
 export function buildAssociationSet(coin: GeneratedCoin, scratch: string, tag: string): { assocPath: string; rootHex: string } {
   const label = JSON.parse(readFileSync(coin.path, "utf8")).coin.label as string;
   const assocPath = `${scratch}/${tag}_assoc.json`;
-  // fresh file each run
-  try { execFileSync("rm", ["-f", assocPath]); } catch { /* ignore */ }
+  try { rmSync(assocPath, { force: true }); } catch { /* ignore */ }
   execFileSync(COINUTILS, ["update-association", assocPath, label], { encoding: "utf8" });
   const root = JSON.parse(readFileSync(assocPath, "utf8")).root as string;
   return { assocPath, rootHex: "0x" + BigInt(root).toString(16).padStart(64, "0") };
@@ -84,9 +92,9 @@ export function buildTransferProof(coin: GeneratedCoin, commitmentsDecimal: stri
   const wtns = `${scratch}/${tag}_x.wtns`;
   const proofJson = `${scratch}/${tag}_x_proof.json`;
   const publicJson = `${scratch}/${tag}_x_public.json`;
-  execFileSync("snarkjs", ["wtns", "calculate", `${PT_CIRCUITS}/build/main_js/main.wasm`, witnessPath, wtns], { encoding: "utf8" });
-  execFileSync("snarkjs", ["groth16", "prove", `${PT_CIRCUITS}/output/main_final.zkey`, wtns, proofJson, publicJson], { encoding: "utf8" });
-  const verify = execFileSync("snarkjs", ["groth16", "verify", `${PT_CIRCUITS}/output/main_verification_key.json`, publicJson, proofJson], { encoding: "utf8" });
+  snarkjs(["wtns", "calculate", `${PT_CIRCUITS}/build/main_js/main.wasm`, witnessPath, wtns]);
+  snarkjs(["groth16", "prove", `${PT_CIRCUITS}/output/main_final.zkey`, wtns, proofJson, publicJson]);
+  const verify = snarkjs(["groth16", "verify", `${PT_CIRCUITS}/output/main_verification_key.json`, publicJson, proofJson]);
 
   const proofHex = execFileSync(C2S, ["proof", proofJson], { encoding: "utf8" }).trim();
   const publicHex = execFileSync(C2S, ["public", publicJson], { encoding: "utf8" }).trim();
@@ -187,9 +195,9 @@ export function buildNoteProof(
   // Use snarkjs `wtns calculate` (the circuit wasm directly) instead of the
   // generated generate_witness.js, which is CommonJS and breaks under this
   // ESM ("type":"module") workspace.
-  execFileSync("snarkjs", ["wtns", "calculate", `${CIRCUITS}/build/main_js/main.wasm`, inputPath, wtns], { encoding: "utf8" });
-  execFileSync("snarkjs", ["groth16", "prove", `${CIRCUITS}/output/main_final.zkey`, wtns, proofJson, publicJson], { encoding: "utf8" });
-  const verify = execFileSync("snarkjs", ["groth16", "verify", `${CIRCUITS}/output/main_verification_key.json`, publicJson, proofJson], { encoding: "utf8" });
+  snarkjs(["wtns", "calculate", `${CIRCUITS}/build/main_js/main.wasm`, inputPath, wtns]);
+  snarkjs(["groth16", "prove", `${CIRCUITS}/output/main_final.zkey`, wtns, proofJson, publicJson]);
+  const verify = snarkjs(["groth16", "verify", `${CIRCUITS}/output/main_verification_key.json`, publicJson, proofJson]);
 
   const proofHex = execFileSync(C2S, ["proof", proofJson], { encoding: "utf8" }).trim();
   const publicHex = execFileSync(C2S, ["public", publicJson], { encoding: "utf8" }).trim();
@@ -255,9 +263,9 @@ export function buildDepositProof(coin: GeneratedCoin, b: DepositBinding, scratc
   const wtns = `${scratch}/${tag}_dep.wtns`;
   const proofJson = `${scratch}/${tag}_dep_proof.json`;
   const publicJson = `${scratch}/${tag}_dep_public.json`;
-  execFileSync("snarkjs", ["wtns", "calculate", `${DEPOSIT_CIRCUITS}/build/main_js/main.wasm`, inputPath, wtns], { encoding: "utf8" });
-  execFileSync("snarkjs", ["groth16", "prove", `${DEPOSIT_CIRCUITS}/output/main_final.zkey`, wtns, proofJson, publicJson], { encoding: "utf8" });
-  const verify = execFileSync("snarkjs", ["groth16", "verify", `${DEPOSIT_CIRCUITS}/output/main_verification_key.json`, publicJson, proofJson], { encoding: "utf8" });
+  snarkjs(["wtns", "calculate", `${DEPOSIT_CIRCUITS}/build/main_js/main.wasm`, inputPath, wtns]);
+  snarkjs(["groth16", "prove", `${DEPOSIT_CIRCUITS}/output/main_final.zkey`, wtns, proofJson, publicJson]);
+  const verify = snarkjs(["groth16", "verify", `${DEPOSIT_CIRCUITS}/output/main_verification_key.json`, publicJson, proofJson]);
 
   const proofHex = execFileSync(C2S, ["proof", proofJson], { encoding: "utf8" }).trim();
   const publicHex = execFileSync(C2S, ["public", publicJson], { encoding: "utf8" }).trim();
