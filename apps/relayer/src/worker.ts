@@ -367,11 +367,7 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
         const pubkeysJson = JSON.stringify(sigs.map(s => stripHex(s.signingPubkey)));
         const sigsJson    = JSON.stringify(sigs.map(s => stripHex(s.signature)));
 
-        // Include ZK proof args when proof generation succeeded.
-        const proofArgs = zkProofHex && zkPublicHex
-          ? ["--proof_bytes", zkProofHex, "--pub_signals_bytes", zkPublicHex]
-          : [];
-
+        // Pass proof_bytes / pub_signals_bytes as Some(hex) or null (Option<Bytes>).
         const r = sorobanInvoke({
           contractId: poolContract, secret: env.STELLAR_RELAYER_SECRET,
           method: "mpc_settle", rpcUrl: RPC, passphrase: PASS, retries: 3,
@@ -384,7 +380,8 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
             "--batch_hash",          hash32,
             "--signer_pubkeys",      pubkeysJson,
             "--signatures",          sigsJson,
-            ...proofArgs
+            "--proof_bytes",         zkProofHex ?? "null",
+            "--pub_signals_bytes",   zkPublicHex ?? "null",
           ]
         });
         return {

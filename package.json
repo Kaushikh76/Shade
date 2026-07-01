@@ -55,6 +55,7 @@
     "mpc:rfq:e2e": "tsx apps/cli/src/mpc-rfq-e2e.ts",
     "mpc:integration": "tsx apps/cli/src/phase2-integration.ts",
     "sdk:test": "tsx packages/sdk/src/sdk-test.ts",
+    "deploy:mpc:verifier": "tsx scripts/deploy-mpc-verifier.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

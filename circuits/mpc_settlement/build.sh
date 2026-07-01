@@ -21,27 +21,44 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BUILD="${SCRIPT_DIR}/build"
 OUTPUT="${SCRIPT_DIR}/output"
-PTAU="${SCRIPT_DIR}/../../.ptau"   # shared ptau cache outside repo
-PTAU_FILE="${PTAU}/hermez_final_15.ptau"
-PTAU_URL="https://hermez.s3-eu-west-1.amazonaws.com/powersOfTau28_hez_final_15.ptau"
+PTAU="${SCRIPT_DIR}/../../.ptau"   # shared ptau cache outside repo (gitignored)
+PTAU_FILE="${PTAU}/bls15_final.ptau"
 
 echo "=== mpc_settlement circuit build ==="
 mkdir -p "${BUILD}" "${OUTPUT}" "${PTAU}"
+
+# circomlib include path: prefer global npm install, fall back to local node_modules.
+CIRCOMLIB_GLOBAL="$(npm root -g 2>/dev/null)/circomlib/circuits"
+CIRCOMLIB_LOCAL="$(cd "$(dirname "${SCRIPT_DIR}")/.."; pwd)/node_modules/circomlib/circuits"
+if [ -d "${CIRCOMLIB_GLOBAL}" ]; then
+  CIRCOMLIB="${CIRCOMLIB_GLOBAL}"
+elif [ -d "${CIRCOMLIB_LOCAL}" ]; then
+  CIRCOMLIB="${CIRCOMLIB_LOCAL}"
+else
+  echo "ERROR: circomlib not found. Run: npm install -g circomlib" >&2
+  exit 1
+fi
+echo "      Using circomlib: ${CIRCOMLIB}"
 
 # ── Step 1: Compile circom → r1cs + wasm ─────────────────────────────────────
 echo "[1/5] Compiling circom..."
 circom "${SCRIPT_DIR}/main.circom" \
   --r1cs --wasm --sym \
   --output "${BUILD}" \
-  --prime bn128
+  --prime bls12381 \
+  -l "${CIRCOMLIB}"
 
 echo "      → $(du -sh "${BUILD}/main.r1cs" | cut -f1) r1cs"
 echo "      → $(du -sh "${BUILD}/main_js/main.wasm" | cut -f1) wasm"
 
-# ── Step 2: Download ptau (cached) ───────────────────────────────────────────
+# ── Step 2: Generate dev ptau if not cached ──────────────────────────────────
+# For production, replace with a real multi-party ceremony ptau.
+# bls12381 power-15 supports up to 2^15 = 32,768 constraints.
 if [ ! -f "${PTAU_FILE}" ]; then
-  echo "[2/5] Downloading hermez_final_15.ptau (~1.1 GB)..."
-  curl -L -o "${PTAU_FILE}" "${PTAU_URL}"
+  echo "[2/5] Generating dev ptau (bls12381 power-15)..."
+  node "$(dirname "${SCRIPT_DIR}")/../node_modules/snarkjs/cli.js" powersoftau new bls12381 15 "${PTAU}/bls15_0000.ptau" -v
+  node "$(dirname "${SCRIPT_DIR}")/../node_modules/snarkjs/cli.js" powersoftau contribute "${PTAU}/bls15_0000.ptau" "${PTAU}/bls15_0001.ptau" --name="Dev" -e="shade-dev-$(date +%s)"
+  node "$(dirname "${SCRIPT_DIR}")/../node_modules/snarkjs/cli.js" powersoftau prepare phase2 "${PTAU}/bls15_0001.ptau" "${PTAU_FILE}" -v
 else
   echo "[2/5] Using cached ${PTAU_FILE}"
 fi

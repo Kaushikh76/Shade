@@ -75,6 +75,8 @@ pub enum Error {
     UnauthorizedSolver = 23,// C4 solver_pubkey is not in the authorized-solver registry
     MpcThreshold = 24,      // Phase 8: fewer than 2/3 committee signatures verified
     MpcUnknownSigner = 25,  // Phase 8: a provided signer pubkey is not in the registered committee
+    MpcProofInvalid = 26,   // Phase C: mpc_settlement ZK proof failed verification
+    MpcSignalMismatch = 27, // Phase C: proof public signal != provided argument
 }
 
 const ADMIN: Symbol = symbol_short!("admin");
@@ -89,6 +91,7 @@ const ASSOCROOT: Symbol = symbol_short!("assocroot"); // #4 ASP allowlist root b
 const XVERIFIER: Symbol = symbol_short!("xverifier"); // #2 PrivateTransfer verifier (separate circuit/vk)
 const DEPVERIFIER: Symbol = symbol_short!("depverif"); // P1.8 DepositNoteMint verifier (separate circuit/vk)
 const MPC_CMTE: Symbol = symbol_short!("mpc_cmte");   // Phase 8: Vec<BytesN<32>> committee ed25519 pubkeys
+const MPC_VERIFIER: Symbol = symbol_short!("mpc_verif"); // Phase C: mpc_settlement Groth16 verifier contract
 
 #[contracttype]
 enum DataKey {
@@ -659,13 +662,28 @@ impl ShieldedPool {
         env.storage().instance().get(&MPC_CMTE).unwrap_or(Vec::new(&env))
     }
 
+    /// Phase C: set the mpc_settlement Groth16 verifier (admin-only).
+    /// Once set, mpc_settle() requires a valid ZK proof alongside the committee sigs.
+    pub fn set_mpc_verifier(env: Env, verifier: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&MPC_VERIFIER, &verifier);
+    }
+
+    /// Phase C: return the mpc_settlement verifier address (None = not configured).
+    pub fn get_mpc_verifier(env: Env) -> Option<Address> {
+        env.storage().instance().get(&MPC_VERIFIER)
+    }
+
     /// Settle one matched pair from a committee-signed batch.
     ///
     /// Verification steps:
     ///   1. Require ≥ ceil(2n/3) valid ed25519 signatures from registered committee nodes.
-    ///   2. Spend nullifier_a and nullifier_b (prevents double-settle / double-withdraw).
-    ///   3. Record the new Merkle root (which now includes output_commitment_a + output_commitment_b).
-    ///   4. Emit a settlement event so off-chain indexers can credit the output notes.
+    ///   2. If mpc_verifier is set (Phase C): verify the Groth16 mpc_settlement proof
+    ///      and check its public signals match nullifier_a/b, output_commitment_a/b,
+    ///      batch_hash, poolId, and chainId. Proof is mandatory once the verifier is set.
+    ///   3. Spend nullifier_a and nullifier_b (prevents double-settle / double-withdraw).
+    ///   4. Record the new Merkle root (which now includes output_commitment_a + output_commitment_b).
+    ///   5. Emit a settlement event so off-chain indexers can credit the output notes.
     ///
     /// Arguments:
     ///   nullifier_a / nullifier_b      — domain-separated nullifiers of the two input notes.
@@ -673,6 +691,7 @@ impl ShieldedPool {
     ///   new_root                       — Merkle root after inserting both output commitments off-chain.
     ///   batch_hash                     — sha256 of the canonical match JSON the committee signed.
     ///   signer_pubkeys / signatures    — parallel vecs; each must be a registered committee member.
+    ///   proof_bytes / pub_signals_bytes — Groth16 proof (required when mpc_verifier is set).
     pub fn mpc_settle(
         env: Env,
         nullifier_a: BytesN<32>,
@@ -683,6 +702,8 @@ impl ShieldedPool {
         batch_hash: BytesN<32>,
         signer_pubkeys: Vec<BytesN<32>>,
         signatures: Vec<BytesN<64>>,
+        proof_bytes: Option<Bytes>,
+        pub_signals_bytes: Option<Bytes>,
     ) {
         Self::require_not_paused(&env);
 
@@ -726,6 +747,66 @@ impl ShieldedPool {
 
         if verified < threshold {
             panic_err(&env, Error::MpcThreshold);
+        }
+
+        // Phase C: ZK proof verification (required when mpc_verifier is configured).
+        //
+        // mpc_settlement public signal layout:
+        //   [0] nullifierHashA   [1] nullifierHashB
+        //   [2] outputCommitmentA [3] outputCommitmentB
+        //   [4] stateRoot         [5] associationRoot
+        //   [6] batchHash (= hashToField(batch_hash))
+        //   [7] poolId            [8] chainId
+        //   [9] matchedAmount7dp  [10] deadlineLedger
+        if let Some(mpc_verifier) = env.storage().instance().get::<Symbol, Address>(&MPC_VERIFIER) {
+            let pb = proof_bytes.unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
+            let sb = pub_signals_bytes.unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
+
+            let ok: bool = env.invoke_contract(
+                &mpc_verifier,
+                &Symbol::new(&env, "verify"),
+                vec![&env, pb.to_val(), sb.to_val()],
+            );
+            if !ok {
+                panic_err(&env, Error::MpcProofInvalid);
+            }
+
+            // Bind proof public signals to the provided call arguments.
+            let signals = parse_public_signals(&env, &sb);
+            // [0] nullifierHashA must equal nullifier_a
+            if signals.get(0).unwrap() != nullifier_a {
+                panic_err(&env, Error::MpcSignalMismatch);
+            }
+            // [1] nullifierHashB must equal nullifier_b
+            if signals.get(1).unwrap() != nullifier_b {
+                panic_err(&env, Error::MpcSignalMismatch);
+            }
+            // [2] outputCommitmentA must equal output_commitment_a
+            if signals.get(2).unwrap() != output_commitment_a {
+                panic_err(&env, Error::MpcSignalMismatch);
+            }
+            // [3] outputCommitmentB must equal output_commitment_b
+            if signals.get(3).unwrap() != output_commitment_b {
+                panic_err(&env, Error::MpcSignalMismatch);
+            }
+            // [4] stateRoot must be a known root (input notes were in this tree)
+            let state_root: BytesN<32> = signals.get(4).unwrap();
+            if !env.storage().persistent().get(&DataKey::KnownRoot(state_root)).unwrap_or(false) {
+                panic_err(&env, Error::UnknownRoot);
+            }
+            // [6] batchHash field element must match hashToField(batch_hash)
+            let batch_hash_field = Self::hash_to_field(&env, &batch_hash);
+            if signals.get(6).unwrap() != batch_hash_field {
+                panic_err(&env, Error::MpcSignalMismatch);
+            }
+            // [7][8] poolId and chainId match this contract's domain separators
+            let pool_id: u32 = env.storage().instance().get(&POOLID).unwrap();
+            let chain_id: u32 = env.storage().instance().get(&CHAINID).unwrap();
+            let pool_in: i128 = fr32_to_i128(&signals.get(7).unwrap());
+            let chain_in: i128 = fr32_to_i128(&signals.get(8).unwrap());
+            if pool_in != pool_id as i128 || chain_in != chain_id as i128 {
+                panic_err(&env, Error::WrongDomain);
+            }
         }
 
         // Spend both nullifiers atomically.  NullifierRegistry.spend panics if already used.
