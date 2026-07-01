@@ -851,6 +851,11 @@ impl ShieldedPool {
         token::TokenClient::new(&env, &usdc).balance(&env.current_contract_address())
     }
 
+    pub fn upgrade(env: Env, new_wasm_hash: soroban_sdk::BytesN<32>) {
+        Self::require_admin(&env);
+        env.deployer().update_current_contract_wasm(new_wasm_hash);
+    }
+
     pub fn pause(env: Env) {
         Self::require_admin(&env);
         env.storage().instance().set(&PAUSED, &true);

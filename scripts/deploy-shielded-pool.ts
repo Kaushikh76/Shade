@@ -19,11 +19,16 @@ const SHADE_ROOT = process.env.SHADE_ROOT ?? process.cwd();
 const RPC = process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const PASS = process.env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
 const WASM_DIR = resolve(SHADE_ROOT, "contracts/stellar/target/wasm32v1-none/release");
-const C2S = process.env.CIRCOM2SOROBAN_BIN ?? resolve(SHADE_ROOT, "tools/circom2soroban/target/release/circom2soroban");
+const C2S_BASE = process.env.CIRCOM2SOROBAN_BIN ?? resolve(SHADE_ROOT, "tools/circom2soroban/target/release/circom2soroban");
+const C2S = process.platform === "win32" && !C2S_BASE.endsWith(".exe") ? C2S_BASE + ".exe" : C2S_BASE;
 const POOL_ID = process.env.SHADE_POOL_ID ?? "1";
 const CHAIN_ID = process.env.SHADE_CHAIN_ID ?? "148";
 const TMM = process.env.STELLAR_CCTP_TOKEN_MESSENGER_MINTER ?? "CDNG7HXAPBWICI2E3AUBP3YZWZELJLYSB6F5CC7WLDTLTHVM74SLRTHP";
-const SH_PATH = `${process.env.HOME}/.cargo/bin:${process.env.PATH ?? ""}`;
+const CARGO_BIN = process.platform === "win32"
+  ? `${process.env.USERPROFILE ?? ""}\.cargo\bin`
+  : `${process.env.HOME ?? ""}/.cargo/bin`;
+const PATH_SEP = process.platform === "win32" ? ";" : ":";
+const SH_PATH = `${CARGO_BIN}${PATH_SEP}${process.env.PATH ?? ""}`;
 
 const env = loadEnv(".env.generated");
 const deployer = req(env, "STELLAR_DEPLOYER_SECRET");

@@ -23,8 +23,13 @@ const SHADE_ROOT = process.env.SHADE_ROOT ?? process.cwd();
 const RPC = process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
 const PASS = process.env.STELLAR_NETWORK_PASSPHRASE ?? "Test SDF Network ; September 2015";
 const WASM_DIR = resolve(SHADE_ROOT, "contracts/stellar/target/wasm32v1-none/release");
-const C2S = process.env.CIRCOM2SOROBAN_BIN ?? resolve(SHADE_ROOT, "tools/circom2soroban/target/release/circom2soroban");
-const SH_PATH = `${process.env.HOME}/.cargo/bin:${process.env.PATH ?? ""}`;
+const C2S_BASE = process.env.CIRCOM2SOROBAN_BIN ?? resolve(SHADE_ROOT, "tools/circom2soroban/target/release/circom2soroban");
+const C2S = process.platform === "win32" && !C2S_BASE.endsWith(".exe") ? C2S_BASE + ".exe" : C2S_BASE;
+const CARGO_BIN = process.platform === "win32"
+  ? `${process.env.USERPROFILE ?? ""}\.cargo\bin`
+  : `${process.env.HOME ?? ""}/.cargo/bin`;
+const PATH_SEP = process.platform === "win32" ? ";" : ":";
+const SH_PATH = `${CARGO_BIN}${PATH_SEP}${process.env.PATH ?? ""}`;
 
 const env = loadEnv(".env.generated");
 const deployer = req(env, "STELLAR_DEPLOYER_SECRET");
@@ -57,20 +62,19 @@ if (env.MPC_VERIFIER_CONTRACT) {
   console.log(`MPC_VERIFIER_CONTRACT: ${verifierId}`);
 }
 
-// Wire the verifier to the pool — once set, all mpc_settle calls require a ZK proof.
-console.log(`Wiring pool.set_mpc_verifier(${env.MPC_VERIFIER_CONTRACT})…`);
-invoke(deployer, pool, ["set_mpc_verifier", "--verifier", env.MPC_VERIFIER_CONTRACT]);
-console.log("Pool wired: mpc_settle now requires a Groth16 proof alongside committee sigs.");
-
-// Upgrade the pool wasm to the newly built version that includes the proof_bytes params.
-// Only runs when SHADE_UPGRADE_POOL=1 is explicitly set — wasm upgrade is destructive
-// if the contract interface changed in a way that breaks existing calls.
+// Upgrade the pool wasm BEFORE wiring — set_mpc_verifier only exists in the new wasm.
+// Only runs when SHADE_UPGRADE_POOL=1 is explicitly set.
 if (process.env.SHADE_UPGRADE_POOL === "1") {
   console.log("Upgrading pool wasm (SHADE_UPGRADE_POOL=1)…");
   const wasmPath = resolve(WASM_DIR, "shielded_pool.wasm");
   invoke(deployer, pool, ["upgrade", "--new_wasm_hash", wasmHash(deployer, wasmPath)]);
   console.log("Pool wasm upgraded.");
 }
+
+// Wire the verifier to the pool — once set, all mpc_settle calls require a ZK proof.
+console.log(`Wiring pool.set_mpc_verifier(${env.MPC_VERIFIER_CONTRACT})…`);
+invoke(deployer, pool, ["set_mpc_verifier", "--verifier", env.MPC_VERIFIER_CONTRACT]);
+console.log("Pool wired: mpc_settle now requires a Groth16 proof alongside committee sigs.");
 
 console.log("Phase C deploy PASS");
 
