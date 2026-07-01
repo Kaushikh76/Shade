@@ -19,11 +19,11 @@ Remaining work is in three areas: **production hardening**, **new flows**, and *
 | Priority | Area | Status | Action |
 |---|---|---|---|
 | 1 | MPC | ✅ Done | Persistent keypairs confirmed in DB; real Merkle root fix shipped (`cdf4abe`) |
-| 2 | CI/CD | ⏳ Pending | Add GitHub Actions — build + test gates on every PR |
+| 2 | CI/CD | ✅ Done | `.github/workflows/ci.yml` — typecheck + vault/SDK/security tests + Soroban contract build on every PR |
 | 3 | SDK | ✅ Done | `packages/sdk` built + 49/49 smoke test pass — Phase B MPC checks included |
-| 4 | ZK circuit build | ⏳ Pending | Run `bash circuits/mpc_settlement/build.sh` — requires `circom` + ~1 GB ptau download |
-| 5 | On-chain ZK verify | ⏳ Pending | After build.sh: deploy mpc_settlement verifier, update `mpc_settle()` to verify proof |
-| 6 | Note Recovery | ⏳ Pending | Implement `/v1/notes/recover` + seed-based key derivation |
+| 4 | ZK circuit build | ✅ Done | `mpc_settlement` compiled (BLS12-381), trusted setup complete, VK confirmed (nPublic=11, IC=12) |
+| 5 | On-chain ZK verify | ✅ Done | MPC verifier deployed (`CCOXS44B…`), shielded pool redeployed (`CDX2H5E4…`), `mpc_settle()` enforces ZK proof + committee sigs |
+| 6 | Note Recovery | ✅ Done | `POST /v1/notes/recover` — returns encrypted vault envelopes + note backups for client-side decryption; Privy-auth + plaintext gate + audit log |
 
 ---
 
@@ -44,23 +44,22 @@ Remaining work is in three areas: **production hardening**, **new flows**, and *
 
 | Circuit | Status | What it must prove |
 |---|---|---|
-| **`mpc_settlement`** | ✅ Written — **build pending** | Both input notes in state tree, ASP compliance, domain-sep nullifiers, output commitments, value conservation, batchHash pass-through. Run `bash circuits/mpc_settlement/build.sh` to compile + setup. |
+| **`mpc_settlement`** | ✅ **Complete** — compiled (BLS12-381), zkey + VK generated, verifier deployed on testnet, `mpc_settle()` enforces proof | Both input notes in state tree, ASP compliance, domain-sep nullifiers, output commitments, value conservation, batchHash pass-through. |
 | `rfq_settlement` (standalone) | ⏳ Not written | Note ownership + nullifier + accepted quote hash + intent hash + solver ID + fill constraints + output commitment + fee + policy |
 | `compliance_membership` | ⏳ Not written | ASP allow-root membership + deny-root non-membership + policy ID + validity window |
 | `proof_of_fill_claim` | ⏳ Not written | Intent hash + fill receipt hash + solver ID + destination tx hash + amount + recipient + deadline + quote hash |
 | `remit_settlement` | ⏳ Not written | Note ownership + nullifier + quote ID hash + payout corridor + amount + policy |
 
-### mpc_settlement — what "build pending" means
+### mpc_settlement — deployed ✅
 
-The circuit source (`circuits/mpc_settlement/main.circom`) is complete and correct.
-What still needs to happen before on-chain ZK verification works:
+All four steps are complete as of 2026-07-01:
+1. **Compiled** with `--prime bls12381`; WASM + R1CS in `circuits/mpc_settlement/build/`.
+2. **Trusted setup** complete; `main_final.zkey` + `main_verification_key.json` in `circuits/mpc_settlement/output/`.
+3. **Verifier deployed**: `MPC_VERIFIER_CONTRACT=CCOXS44BQHBDO6NHCUUY3TBVSHVHZB2NKEWCZWQIKBHKLN4YQAEVJUD6`
+4. **Pool redeployed**: `SHIELDED_POOL_CONTRACT=CDX2H5E4WIQY6QRBRHWOEXYTYOM2J2OFEKQWHKXKL4ASNHJNPI2MXKKJ`
+   — `mpc_settle()` now requires a Groth16 proof + committee sigs; verifier is wired via `set_mpc_verifier()`.
 
-1. **Compile**: `bash circuits/mpc_settlement/build.sh` — generates `.r1cs`, `.wasm`, `.zkey`, `.vk.json` (takes 5-10 min, requires ~1.1 GB ptau download on first run).
-2. **Deploy verifier**: run `circom2soroban vk circuits/mpc_settlement/output/main_verification_key.json` → deploy the Soroban verifier contract.
-3. **Update `mpc_settle()`**: add `proof_bytes: BytesN<256>` + `pub_signals_bytes: BytesN<...>` args to the shielded pool contract and call the verifier.
-4. **Redeploy pool**: contracts must be rebuilt after step 3.
-
-The relayer worker (`MPC_SETTLE_SUBMIT`) already generates and passes proof bytes when artifacts are present (graceful fallback to committee-sig-only when they are not).
+The relayer worker generates proof bytes from the witness builder when circuit artifacts are present, with graceful fallback to committee-sig-only when not built.
 
 ---
 
@@ -90,8 +89,8 @@ The relayer worker (`MPC_SETTLE_SUBMIT`) already generates and passes proof byte
 - No compliance package stub
 
 ### Note Recovery
-- `/v1/notes/recover` endpoint not implemented
-- No seed-based note key derivation for users
+- ✅ `POST /v1/notes/recover` — returns all encrypted vault envelopes + note backups; client decrypts locally
+- No seed-based note key derivation (not yet needed — recovery uses existing vault wrappers)
 
 ### View-Key / Compliance Reports
 - No view-key report generation
@@ -116,7 +115,7 @@ The relayer worker (`MPC_SETTLE_SUBMIT`) already generates and passes proof byte
 
 | Item | Status |
 |---|---|
-| CI/CD pipeline | No GitHub Actions or CI config exists |
+| CI/CD pipeline | ✅ `.github/workflows/ci.yml` — PR gates for TS build, unit tests, security gates, Soroban contracts |
 | Monitoring (Prometheus / Grafana) | Not set up |
 | Object storage (S3/R2/MinIO) | Not implemented — encrypted payloads currently in DB |
 | Key management (KMS/HSM) | Not set up — keys live in `.env.generated` |

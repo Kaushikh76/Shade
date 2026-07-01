@@ -97,6 +97,34 @@ async function makeEnvelope(privyUserId: string, evmOnly = false): Promise<{ env
     const otherTok = await tokenFor("did:privy:attacker");
     const cross = await app.inject({ method: "GET", url: `/v1/note-vaults/${env.vault_id}`, headers: { authorization: `Bearer ${otherTok}` } });
     check("another user cannot read the vault (404)", cross.statusCode === 404);
+
+    // ---- Note recovery ----
+    // unauthenticated recovery rejected
+    const noAuthRecover = await app.inject({ method: "POST", url: "/v1/notes/recover", payload: {} });
+    check("POST /v1/notes/recover 401 without token", noAuthRecover.statusCode === 401);
+
+    // store an encrypted note backup for this user
+    const commitment = "0x" + "aa".repeat(32);
+    const backupRes = await app.inject({ method: "POST", url: "/v1/notes/encrypted-backup", headers: authH, payload: { commitment, encrypted_payload: "0x" + "bb".repeat(64), encryption_version: "v1" } });
+    check("store encrypted note backup", backupRes.statusCode === 200);
+
+    // recovery returns vault envelope + note backups
+    const recoverRes = json(await app.inject({ method: "POST", url: "/v1/notes/recover", headers: authH, payload: {} }));
+    const vaultArr = recoverRes.vaults as Array<Record<string, unknown>>;
+    const backupArr = recoverRes.note_backups as Array<Record<string, unknown>>;
+    check("recover returns vaults with envelope", Array.isArray(vaultArr) && vaultArr.length >= 1 && !!vaultArr[0].envelope);
+    check("recover returns note_backups", Array.isArray(backupArr) && backupArr.length >= 1);
+    check("recover response has no plaintext note fields", !JSON.stringify(recoverRes).includes("note_preimage"));
+
+    // vault_id filter: specific vault returned
+    const filteredRecover = json(await app.inject({ method: "POST", url: "/v1/notes/recover", headers: authH, payload: { vault_id: env.vault_id } }));
+    const filtered = filteredRecover.vaults as Array<Record<string, unknown>>;
+    check("recover with vault_id filter returns matching vault", Array.isArray(filtered) && filtered.length === 1 && filtered[0].vault_id === env.vault_id);
+
+    // attacker cannot recover other user's notes
+    const attackerRecover = await app.inject({ method: "POST", url: "/v1/notes/recover", headers: { authorization: `Bearer ${otherTok}` }, payload: {} });
+    const attackerData = json(attackerRecover);
+    check("attacker recover returns empty vaults (isolation)", attackerRecover.statusCode === 200 && (attackerData.vaults as unknown[]).length === 0);
   } catch (e) {
     check("vault-api test harness", false, (e as Error).message.slice(0, 200));
   }

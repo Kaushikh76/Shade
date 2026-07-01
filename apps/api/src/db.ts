@@ -383,6 +383,17 @@ export class Store {
     return rows;
   }
 
+  async listNoteVaultsForRecovery(userId: string, vaultId?: string): Promise<Array<Record<string, unknown>>> {
+    const filter = vaultId ? " and vault_id=$2" : "";
+    const params: unknown[] = vaultId ? [userId, vaultId] : [userId];
+    const { rows } = await this.pool.query(
+      `select vault_id, envelope, ciphertext, aad, backup_status, recovery_policy_status, created_at, updated_at
+       from note_vaults where user_id=$1${filter} order by created_at desc`,
+      params
+    );
+    return rows;
+  }
+
   async addNoteBackup(userId: string, commitment: string, encryptedPayload: string, version: string): Promise<void> {
     await this.pool.query(
       `insert into encrypted_note_backups(user_id, commitment, encrypted_payload, encryption_version) values ($1,$2,$3,$4)

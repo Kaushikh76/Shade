@@ -39,6 +39,7 @@ import {
   idempotencyHeader,
   lockSchema,
   noteBackupSchema,
+  noteRecoverSchema,
   prepareDepositSchema,
   proofRequestSchema,
   quoteAcceptanceSchema,
@@ -326,6 +327,33 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
     await store.addNoteBackup(userId, body.commitment, body.encrypted_payload, body.encryption_version);
     await store.logActivity(userId, { event_type: "note.backup", entity_type: "note", entity_id: body.commitment });
     return { ok: true, commitment: body.commitment };
+  });
+
+  // Note recovery: returns all encrypted vault envelopes + note backups so the client
+  // can decrypt and restore notes locally. The server returns only ciphertext — no
+  // plaintext note fields ever leave the client. Requires Privy auth; logs for audit.
+  app.post("/v1/notes/recover", async (request) => {
+    const auth = await requirePrivyUser(store, request);
+    const body = noteRecoverSchema.parse(request.body ?? {});
+    const vaults = await store.listNoteVaultsForRecovery(auth.userId, body.vault_id);
+    // Belt-and-suspenders: ensure no plaintext note secrets leaked into stored envelopes.
+    for (const v of vaults) assertNoPlaintextNoteFields(v.envelope);
+    const noteBackups = await store.listByUser("encrypted_note_backups", auth.userId);
+    await store.logActivity(auth.userId, {
+      event_type: "notes.recover",
+      metadata: { vault_count: vaults.length, backup_count: noteBackups.length, vault_id: body.vault_id ?? null }
+    });
+    return {
+      vaults: vaults.map(v => ({
+        vault_id: v.vault_id,
+        envelope: v.envelope,
+        backup_status: v.backup_status,
+        recovery_policy_status: v.recovery_policy_status,
+        created_at: v.created_at
+      })),
+      note_backups: noteBackups,
+      recovery_started_at: new Date().toISOString()
+    };
   });
 
   // ---- Note vaults (PHASE 4): encrypted-vault storage + recovery policy ----

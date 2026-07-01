@@ -173,6 +173,11 @@ export const syncPrivyWalletsSchema = z.object({
   }).refine((w) => w.wallet_type === "EVM" ? /^0x[a-fA-F0-9]{40}$/.test(w.address) : /^G[A-Z2-7]{55}$/.test(w.address), { message: "invalid address for wallet_type" })).min(1)
 });
 
+// Note recovery: returns full vault envelopes + note backups for client-side decryption.
+export const noteRecoverSchema = z.object({
+  vault_id: z.string().min(1).optional()
+});
+
 // FIX3: real backup verification — client must send a non-empty proof-of-decrypt.
 export const verifyBackupSchema = z.object({
   verification: z.object({
