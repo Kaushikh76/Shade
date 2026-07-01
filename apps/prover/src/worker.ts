@@ -49,9 +49,13 @@ export async function processProofJob(queue: JobQueue, job: ServiceJob): Promise
 
   let result: Record<string, unknown>;
   if (job.job_type === "private_transfer") {
-    const pr = buildTransferProof(coin, p.commitmentsDecimal ?? [coin.commitmentDecimal], p.scope ?? "shade", p.fee7dp ?? "0", SCRATCH, tag);
+    // P2 #14: private_transfer now carries an ASP allow-set binding — require
+    // assocPath the same way withdraw does, so a proof can't silently skip
+    // the compliance envelope by omitting it.
+    if (!p.assocPath) throw new Error(`${job.job_type} requires assocPath`);
+    const pr = buildTransferProof(coin, p.commitmentsDecimal ?? [coin.commitmentDecimal], p.scope ?? "shade", p.fee7dp ?? "0", SCRATCH, tag, p.assocPath);
     await assertVerified(queue, job, pr.locallyVerified);
-    result = { proofHex: pr.proofHex, publicHex: pr.publicHex, stateRootHex: pr.stateRootHex, outputCommitmentHex: pr.outputCommitmentHex };
+    result = { proofHex: pr.proofHex, publicHex: pr.publicHex, stateRootHex: pr.stateRootHex, associationRootHex: pr.associationRootHex, outputCommitmentHex: pr.outputCommitmentHex };
   } else if (job.job_type === "deposit_note_mint") {
     if (!p.depositBinding) throw new Error("deposit_note_mint requires depositBinding");
     const pr = buildDepositProof(coin, p.depositBinding, SCRATCH, tag);

@@ -1,18 +1,28 @@
 import "dotenv/config";
 import Fastify from "fastify";
+import pg from "pg";
 import { v4 as uuidv4 } from "uuid";
 import {
   generateNodeKeyPair, nodePublicInfo,
-  decryptShare, verifySignedBatch,
+  verifySignedBatch,
   type MpcIntent, type EncryptedShare
 } from "@shade/mpc-crypto";
 import { CommitteeState } from "./state.js";
 import { runMatchingRound } from "./coordinator.js";
 import { runSettlerLoop } from "./settler.js";
 import { loadOrGenerateKeys } from "./keys.js";
+import { persistSignedBatch } from "./persist.js";
 
-// Three committee nodes run in the same process (simulating a distributed committee).
-// Each node has its own key pair. In production they'd be separate services.
+// DEV/DEMO MODE ONLY: three committee nodes + the coordinator run in this one
+// process, so one process holds all three secret keys simultaneously — no
+// real trust distribution (P4 #24). This is fine for `npm run mpc:dev` /
+// `mpc:e2e` local testing but must not be how a real committee runs.
+//
+// The independent-operator path is node-server.ts (run 3x, one secret key
+// each) + coordinator-server.ts (holds no secret keys — talks to nodes only
+// over authenticated HTTP): `npm run mpc:node:dev` / `mpc:coordinator:dev`.
+// See apps/cli/src/mpc-liveness-e2e.ts for a demonstration that this
+// actually tolerates a node going down and coming back.
 const NODE_IDS = ["node-1", "node-2", "node-3"] as const;
 const NODE_PORTS = { "node-1": 8091, "node-2": 8092, "node-3": 8093 } as const;
 const COORDINATOR_PORT = 8090;
@@ -23,6 +33,12 @@ const dbUrl = process.env.DATABASE_URL;
 const nodes = dbUrl
   ? await loadOrGenerateKeys(dbUrl, NODE_IDS)
   : NODE_IDS.map(id => generateNodeKeyPair(id));
+
+// P1 #12: persist every signed batch here, at the single point both the
+// manual/API-triggered match and the auto-batch timer funnel through — see
+// persistSignedBatch(). Only active when DATABASE_URL is set (matches the
+// settler's own no-DB/in-memory-only demo mode).
+const dbPool = dbUrl ? new pg.Pool({ connectionString: dbUrl }) : null;
 
 const nodeMap = new Map(nodes.map(n => [n.nodeId, n]));
 const committeeInfo = nodes.map(nodePublicInfo);
@@ -70,27 +86,13 @@ async function startNode(nodeIndex: number) {
     }
   );
 
-  // Decrypt and return this node's share for a specific intent (coordinator only).
-  app.post<{ Params: { intentId: string } }>(
-    "/decrypt-share/:intentId",
-    async (request, reply) => {
-      const { intentId } = request.params;
-      const session = state.getSessionForIntent(intentId);
-      if (!session) { reply.code(404); return { error: "intent not found" }; }
-      const entry = session.shares.get(node.nodeId)?.get(intentId);
-      if (!entry) { reply.code(404); return { error: "share not found" }; }
-      try {
-        const decrypted = decryptShare(
-          { ...entry.encryptedShare, nodeId: node.nodeId },
-          node.encryptionKeyPair.secretKey
-        );
-        return { ok: true, share: decrypted };
-      } catch (err) {
-        reply.code(422);
-        return { error: String(err) };
-      }
-    }
-  );
+  // P0 #5: there is intentionally NO network endpoint that returns a node's
+  // decrypted share. Decryption only ever happens in-process during matching
+  // (see coordinator.ts::runMatchingRound), because these three "nodes" share
+  // a process today. A prior version of this file exposed such an endpoint
+  // unauthenticated on 0.0.0.0 — any two callers could reconstruct the secret
+  // amount. Do not re-add it without mutual authentication (mTLS / signed
+  // coordinator request) and a loopback/private-network bind.
 
   await app.listen({ port, host: "0.0.0.0" });
   console.log(`[mpc] node ${node.nodeId} listening on :${port}`);
@@ -145,6 +147,9 @@ async function startCoordinator() {
         return { ok: false, reason: `session already in status '${session.status}'` };
       }
       const result = await runMatchingRound(session, nodes);
+      if (result.ok && dbPool) {
+        await persistSignedBatch(dbPool, session.sessionId, result.batch);
+      }
       return result.ok
         ? { ok: true, batch: result.batch }
         : { ok: false, reason: result.reason };
@@ -193,6 +198,7 @@ function startBatchTimer() {
       console.log(`[mpc] auto-matching session ${session.sessionId} with ${session.intents.size} intents`);
       const result = await runMatchingRound(session, nodes);
       if (result.ok) {
+        if (dbPool) await persistSignedBatch(dbPool, session.sessionId, result.batch);
         console.log(`[mpc] batch ${result.batch.batchId}: ${result.batch.matches.length} matches, signed by ${result.batch.signatures.length} nodes`);
       } else {
         console.warn(`[mpc] matching failed for ${session.sessionId}: ${result.reason}`);

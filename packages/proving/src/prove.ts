@@ -73,6 +73,7 @@ export type TransferProof = {
   proofHex: string;
   publicHex: string;
   stateRootHex: string;
+  associationRootHex: string;
   outputCommitmentHex: string;
   feePublic: string;
   outValue: string;
@@ -81,12 +82,19 @@ export type TransferProof = {
 
 // #2 Build a hidden-amount PrivateTransfer proof: spend `coin`, create an output
 // note of (value - fee). Amounts stay private; only fee + output commitment public.
-export function buildTransferProof(coin: GeneratedCoin, commitmentsDecimal: string[], scope: string, fee7dp: string, scratch: string, tag: string): TransferProof {
+// P2 #14: `assocPath`, when provided, proves the spender's label is in the ASP
+// allow-set (see circuits/private_transfer/main.circom). Omitting it produces a
+// proof that only verifies on-chain against an associationRoot of 0 (compliance
+// disabled) — callers doing real settlement should always supply it, the same
+// way buildNoteProof requires it for withdraw.
+export function buildTransferProof(coin: GeneratedCoin, commitmentsDecimal: string[], scope: string, fee7dp: string, scratch: string, tag: string, assocPath?: string): TransferProof {
   const statePath = `${scratch}/${tag}_xstate.json`;
   writeFileSync(statePath, JSON.stringify({ commitments: commitmentsDecimal, scope }));
   const witnessPath = `${scratch}/${tag}_xfer.json`;
   const outCoinPath = `${scratch}/${tag}_xout.json`;
-  execFileSync(COINUTILS, ["transfer", coin.path, statePath, fee7dp, "--out-scope", `${scope}_out`, "-o", witnessPath, "--out-coin", outCoinPath], { encoding: "utf8" });
+  const args = ["transfer", coin.path, statePath, fee7dp, "--out-scope", `${scope}_out`, "-o", witnessPath, "--out-coin", outCoinPath];
+  if (assocPath) args.push("--association-file", assocPath);
+  execFileSync(COINUTILS, args, { encoding: "utf8" });
   const witness = JSON.parse(readFileSync(witnessPath, "utf8"));
 
   const wtns = `${scratch}/${tag}_x.wtns`;
@@ -101,6 +109,7 @@ export function buildTransferProof(coin: GeneratedCoin, commitmentsDecimal: stri
   return {
     proofHex, publicHex,
     stateRootHex: hexRoot(witness.stateRoot),
+    associationRootHex: hexRoot(witness.associationRoot),
     outputCommitmentHex: hexRoot(witness.outputCommitment),
     feePublic: witness.feePublic,
     outValue: witness.outValue,

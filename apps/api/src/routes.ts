@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { LOCKED_CCTP, usdc6ToStellar7, validateInboundRoute, stellarContractToBytes32, encodeStellarForwardHook, FINALITY_THRESHOLD_CONFIRMED } from "@shade/cctp-utils";
-import { generateNotePreimage, poseidonCommitment } from "@shade/note-crypto";
+import { LOCKED_CCTP, usdc6ToStellar7, stellarContractToBytes32, encodeStellarForwardHook, FINALITY_THRESHOLD_CONFIRMED } from "@shade/cctp-utils";
+import { poseidonCommitment } from "@shade/note-crypto";
 import { hashJson, deterministicId } from "@shade/shared-types/ids";
 import { intentSchema, quoteSchema } from "@shade/rfq-types";
 import { JobQueue } from "@shade/queue";
@@ -40,7 +40,6 @@ import {
   lockSchema,
   noteBackupSchema,
   noteRecoverSchema,
-  prepareDepositSchema,
   proofRequestSchema,
   quoteAcceptanceSchema,
   requestQuotesSchema,
@@ -49,8 +48,10 @@ import {
   updateMeSchema,
   userDepositPrepareSchema,
   verifyBackupSchema,
+  viewKeyReportSchema,
   withdrawalSchema
 } from "./schemas.js";
+import { signViewKeyReport, encryptReportAttachment } from "./shade-view.js";
 
 const CHAIN_FOR: Record<WalletType, string> = { EVM: "arbitrum-sepolia", STELLAR: "stellar-testnet" };
 function randomNonce(): string { return randomUUID().replace(/-/g, ""); }
@@ -187,50 +188,11 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   app.get("/v1/me/cctp-exits", async (request) => ({ exits: await store.listByUser("cctp_exits", await authedUser(store, request)) }));
   app.get("/v1/me/note-backups", async (request) => ({ backups: await store.listByUser("encrypted_note_backups", await authedUser(store, request)) }));
 
-  // DEV-ONLY legacy deposit prepare (builds the note server-side — the old model).
-  // The canonical user path is POST /v1/deposits/prepare (client-side note, user-
-  // signed burn) below. Kept for diagnostics behind the dev namespace.
-  app.post("/v1/dev/deposits/prepare-legacy", async (request) => {
-    requireDevRoutes(); // FIX9
-    const body = prepareDepositSchema.parse(request.body);
-    const idempotencyKey = idem(request);
-    validateInboundRoute({
-      destinationDomain: LOCKED_CCTP.stellarDomain,
-      mintRecipient: LOCKED_CCTP.stellarCctpForwarder,
-      destinationCaller: LOCKED_CCTP.stellarCctpForwarder,
-      forwardRecipient: body.shade_vault_contract
-    });
-    const amount6 = BigInt(body.amount_usdc_6dp);
-    const amount7 = usdc6ToStellar7(amount6);
-    const note = generateNotePreimage({
-      assetId: body.asset_id,
-      amount7dp: amount7.toString(),
-      ownerPublicKey: body.owner_public_key,
-      spendPublicKey: body.spend_public_key,
-      complianceTag: body.compliance_tag,
-      sourceContext: body.source_context,
-      memoCommitment: body.memo_commitment
-    });
-    const commitment = await poseidonCommitment(note);
-    const depositId = deterministicId({ namespace: "dep", parts: [idempotencyKey, commitment] });
-    await store.upsertDeposit({
-      depositId,
-      idempotencyKey,
-      sourceDomain: LOCKED_CCTP.arbitrumSepoliaDomain,
-      destinationDomain: LOCKED_CCTP.stellarDomain,
-      assetId: body.asset_id,
-      amount6: amount6.toString(),
-      amount7: amount7.toString(),
-      commitment,
-      encryptedNotePayloadHash: body.encrypted_note_payload_hash,
-      policyId: body.policy_id,
-      state: "prepared"
-    });
-    await store.transition({ entityType: "cctp_deposit", entityId: depositId, toState: "prepared" });
-    const userId = await authedUserOptional(store, request);
-    if (userId) { await store.setRowUser("cctp_deposits", "deposit_id", depositId, userId); await store.logActivity(userId, { event_type: "deposit.prepare", entity_type: "deposit", entity_id: depositId }); }
-    return { deposit_id: depositId, commitment, amount_usdc_7dp: amount7.toString() };
-  });
+  // P2 #18: the legacy server-side note-prepare path (generateNotePreimage
+  // in-process) was deleted here — Principle #3 requires note secrets never
+  // touch the server, even transiently/dev-only. The canonical path is
+  // POST /v1/deposits/prepare below: the client generates the note and only
+  // sends the server a commitment + encrypted-payload hash.
 
   // ---- PHASE 6: user-signed CCTP deposit (no backend EVM key) ----
   // Returns approval + burn tx requests for the USER's wallet to sign. The backend
@@ -313,11 +275,9 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   depositStep("mint-forward", "STELLAR_MINT_FORWARD");
   depositStep("register-note", "REGISTER_NOTE");
 
-  app.post("/v1/notes/local/derive", async (request) => {
-    requireDevRoutes(); // FIX9: note preimage generation belongs in the browser
-    const note = generateNotePreimage(request.body as never);
-    return { note_secret: "redacted", commitment: await poseidonCommitment(note) };
-  });
+  // P2 #18: /v1/notes/local/derive (server-side generateNotePreimage) was
+  // deleted — note preimage generation belongs entirely in the browser/SDK
+  // (packages/note-vault already provides client-safe crypto for this).
   app.post("/v1/notes/commitment", async (request) => ({ commitment: await poseidonCommitment(request.body as never) }));
   app.get("/v1/notes/:commitment/status", async (request) => store.getById("note_commitments", "commitment", (request.params as { commitment: string }).commitment));
   // Client-side-encrypted note backup (server never sees plaintext or note secrets).
@@ -730,6 +690,78 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   });
   app.get("/v1/settlements/:settlement_id", async (request) => store.getById("settlements", "settlement_id", (request.params as { settlement_id: string }).settlement_id));
 
+  // ---- Shade View: selective disclosure / view-key reports (P2 #13, bible Sec 13.3) ----
+  // The user picks which of THEIR OWN settlements/note commitments to disclose;
+  // ownership is re-checked server-side. The report bundles only values already
+  // public on-chain (commitments, nullifiers, tx hashes), never note secrets.
+  app.post("/v1/reports/view-key", async (request, reply) => {
+    const userId = await authedUser(store, request);
+    const body = viewKeyReportSchema.parse(request.body);
+
+    const serviceSecret = process.env.SHADE_VIEW_SIGNING_SECRET;
+    if (!serviceSecret) { reply.code(503); return { error: "Shade View service not configured (SHADE_VIEW_SIGNING_SECRET unset)" }; }
+
+    const [settlements, commitments] = await Promise.all([
+      store.getOwnedSettlements(userId, body.settlement_ids),
+      store.getOwnedNoteCommitments(userId, body.note_commitments)
+    ]);
+    const ownedSettlementIds = settlements.map(s => String(s.settlement_id));
+    const anchorIds = body.anchor_id ? [body.anchor_id] : await store.getAnchorIdsForSettlements(ownedSettlementIds);
+
+    const disclosedNullifiers = settlements.map(s => String(s.nullifier)).filter(Boolean);
+    const proofLinks = settlements
+      .map(s => s.stellar_tx_hash)
+      .filter((h): h is string => typeof h === "string" && h.length > 0)
+      .map(h => `https://stellar.expert/explorer/testnet/tx/${h}`);
+
+    const amountsDisclosed = body.disclose_amounts
+      ? commitments.map(c => ({ commitment: String(c.commitment), amount7dp: String(c.amount_usdc_7dp), currency: "USDC" }))
+      : undefined;
+
+    const reportId = randomUUID();
+    const signed = signViewKeyReport(
+      {
+        userId,
+        timeRangeFrom: body.time_range_from,
+        timeRangeTo: body.time_range_to,
+        noteCommitments: commitments.map(c => String(c.commitment)),
+        disclosedNullifiers,
+        quoteId: body.quote_id ?? (settlements[0]?.quote_id as string | undefined),
+        policyId: body.policy_id ?? (commitments[0]?.policy_id as string | undefined),
+        anchorId: anchorIds[0],
+        amountsDisclosed,
+        proofLinks
+      },
+      reportId,
+      serviceSecret
+    );
+
+    const encryptedAttachment = body.attachment_recipient_pubkey
+      ? encryptReportAttachment(signed, body.attachment_recipient_pubkey)
+      : undefined;
+
+    await store.insertViewKeyReport({
+      reportId, userId,
+      timeRangeFrom: body.time_range_from, timeRangeTo: body.time_range_to,
+      noteCommitments: signed.noteCommitments, disclosedNullifiers: signed.disclosedNullifiers,
+      quoteId: signed.quoteId, policyId: signed.policyId, anchorId: signed.anchorId,
+      amountDisclosed: body.disclose_amounts, proofLinks: signed.proofLinks,
+      servicePubkey: signed.servicePubkeyHex, serviceSignature: signed.serviceSignatureHex,
+      encryptedAttachment
+    });
+    await store.logActivity(userId, { event_type: "shade_view.report.generate", entity_type: "view_key_report", entity_id: reportId });
+
+    return { report: signed, encrypted_attachment: encryptedAttachment ?? null };
+  });
+
+  app.get("/v1/reports/view-key/:report_id", async (request, reply) => {
+    const userId = await authedUser(store, request);
+    const reportId = (request.params as { report_id: string }).report_id;
+    const row = await store.getViewKeyReport(userId, reportId);
+    if (!row) { reply.code(404); return { error: "report not found" }; }
+    return row;
+  });
+
   app.post("/v1/cctp/outbound/prepare", async (request) => {
     const userId = await authedUser(store, request); // FIX7
     await assertRootHealthy(store);
@@ -896,50 +928,18 @@ export async function registerRoutes(app: FastifyInstance, store = new Store(), 
   });
 
   // Manually trigger a matching round for a session (dev/demo endpoint).
+  // P1 #12: persistence of the signed batch (mpc_batches / mpc_batch_signatures
+  // / mpc_sessions / mpc_intents) happens inside the committee service itself
+  // (apps/mpc-committee/src/persist.ts), at the one place both this manual
+  // trigger and the committee's own 30s auto-batch timer funnel through. A
+  // batch persisted only here would never be seen by the settler when the
+  // timer is what actually closed the session.
   app.post("/v1/mpc/sessions/:session_id/match", async (request, reply) => {
     const { session_id } = request.params as { session_id: string };
     try {
       const resp = await fetch(`${mpcUrl()}/v1/mpc/sessions/${session_id}/match`, { method: "POST" });
       const data = await resp.json() as Record<string, unknown>;
       if (!resp.ok) { reply.code(502); return data; }
-
-      // Persist the signed batch if matching succeeded.
-      if (data.ok && data.batch) {
-        const batch = data.batch as Record<string, unknown>;
-        const matches = batch.matches as unknown[];
-        const sigs = batch.signatures as Array<{ nodeId: string; signingPubkey: string; signature: string }>;
-
-        await store.pool.query(
-          `INSERT INTO mpc_batches (batch_id, session_id, batch_hash, match_count, matches_json, signatures_json)
-           VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING`,
-          [batch.batchId, session_id, batch.batchHash, matches.length, JSON.stringify(matches), JSON.stringify(sigs)]
-        );
-
-        // Denormalized per-node signature rows.
-        for (const sig of sigs) {
-          await store.pool.query(
-            `INSERT INTO mpc_batch_signatures (batch_id, node_id, signing_pubkey, signature)
-             VALUES ($1,$2,$3,$4) ON CONFLICT (batch_id, node_id) DO NOTHING`,
-            [batch.batchId, sig.nodeId, sig.signingPubkey, sig.signature]
-          );
-        }
-
-        // Update mpc_sessions and matched intent rows.
-        await store.pool.query(
-          "UPDATE mpc_sessions SET status='signed', match_count=$1, closed_at=now(), updated_at=now() WHERE session_id=$2",
-          [matches.length, session_id]
-        );
-        for (const m of matches as Array<{ intentAId: string; intentBId: string; matchedAmount7dp: string }>) {
-          await store.pool.query(
-            "UPDATE mpc_intents SET status='matched', matched_with=$2, matched_amount_7dp=$3, updated_at=now() WHERE intent_id=$1",
-            [m.intentAId, m.intentBId, m.matchedAmount7dp]
-          );
-          await store.pool.query(
-            "UPDATE mpc_intents SET status='matched', matched_with=$2, matched_amount_7dp=$3, updated_at=now() WHERE intent_id=$1",
-            [m.intentBId, m.intentAId, m.matchedAmount7dp]
-          );
-        }
-      }
       return data;
     } catch {
       reply.code(503);

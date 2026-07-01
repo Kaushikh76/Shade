@@ -1,5 +1,13 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Bytes, BytesN, Env, String, symbol_short};
+//! IntentEscrow: RFQ lifecycle bookkeeping ONLY (intent/quote/accept/lock
+//! records + expiry). It verifies no proofs and holds no settlement
+//! authority. The ONE settlement authority for RFQ is
+//! `shielded_pool::rfq_settle`, which verifies a real Groth16 proof and
+//! spends the nullifier. Do not add a settlement entrypoint here — a prior
+//! `settle_rfq(proof, public_inputs)` existed that only hashed its inputs and
+//! verified nothing (P1 #11); it had zero callers and was removed rather than
+//! left as a decorative, unsafe-looking settlement path.
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, String, symbol_short};
 
 #[contracttype]
 enum DataKey {
@@ -67,11 +75,6 @@ impl IntentEscrow {
         if !env.storage().persistent().has(&DataKey::Quote(quote_hash.clone())) { panic!("quote missing"); }
         env.storage().persistent().set(&DataKey::Lock(quote_hash.clone()), &lock_hash);
         env.events().publish((symbol_short!("lock"), quote_hash), lock_hash);
-    }
-
-    pub fn settle_rfq(env: Env, proof: Bytes, public_inputs: Bytes) -> BytesN<32> {
-        if proof.len() == 0 || public_inputs.len() == 0 { panic!("empty proof"); }
-        env.crypto().sha256(&public_inputs).into()
     }
 
     pub fn mark_failed_recoverable(env: Env, intent_hash: BytesN<32>, reason_hash: BytesN<32>) {

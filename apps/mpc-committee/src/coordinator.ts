@@ -10,7 +10,7 @@ import type { CommitteeState, SessionState } from "./state.js";
 // Simple netting: pair intents with complementary amounts (same asset pair, close amounts).
 // In production this would be a full price-time priority order book.
 
-function matchIntents(
+export function matchIntents(
   intents: Array<{ intentId: string; amount7dp: bigint; inputAsset: string; outputAsset: string }>
 ): MatchResult[] {
   const matches: MatchResult[] = [];
@@ -42,7 +42,10 @@ function matchIntents(
     while (ai < sorted.length && bi < reverseSorted.length) {
       const a = sorted[ai];
       const b = reverseSorted[bi];
-      if (used.has(a.intentId) || used.has(b.intentId)) { ai++; bi++; continue; }
+      // Only advance the side that's actually already used — advancing both
+      // unconditionally can skip a still-unused, otherwise-valid counterparty.
+      if (used.has(a.intentId)) { ai++; continue; }
+      if (used.has(b.intentId)) { bi++; continue; }
 
       const matchAmt = a.amount7dp < b.amount7dp ? a.amount7dp : b.amount7dp;
       matches.push({
@@ -76,6 +79,14 @@ export type CoordinatorResult =
  *   3. Matching algorithm finds crossed pairs.
  *   4. All nodes sign the match batch.
  *   5. Return the signed batch.
+ *
+ * P2 #16 — NOT privacy-preserving MPC: step 2 reconstructs every intent's
+ * plaintext amount in THIS process before matching (see the reconstructed[]
+ * loop below). Whether the 3 "nodes" run in one process or three separate
+ * ones, the matcher itself is fully trusted with every amount for the
+ * duration of this function. Shares are re-nulled immediately after (privacy
+ * hygiene, not a privacy guarantee). Real private matching needs a TEE (V2,
+ * not started) or secure multi-party comparison (V3/V4) — see docs/PENDING.md.
  */
 export async function runMatchingRound(
   session: SessionState,

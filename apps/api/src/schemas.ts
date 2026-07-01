@@ -188,3 +188,18 @@ export const verifyBackupSchema = z.object({
     verified_at_client: z.string().min(1)
   })
 });
+
+// P2 #13 Shade View: user selects which of THEIR OWN settlements/notes to
+// disclose. Ownership is re-checked server-side (settlement_ids/commitments
+// must belong to the authenticated user) — this schema only validates shape.
+export const viewKeyReportSchema = z.object({
+  settlement_ids: z.array(z.string().min(1)).max(200).default([]),
+  note_commitments: z.array(z.string().min(1)).max(200).default([]),
+  time_range_from: z.string().datetime().optional(),
+  time_range_to: z.string().datetime().optional(),
+  quote_id: z.string().min(1).optional(),
+  policy_id: z.string().min(1).optional(),
+  anchor_id: z.string().min(1).optional(),
+  disclose_amounts: z.boolean().default(false),
+  attachment_recipient_pubkey: z.string().regex(/^[0-9a-fA-F]{64}$/).optional()
+});

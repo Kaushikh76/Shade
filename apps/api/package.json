@@ -1,1 +1,1 @@
-{"name":"@shade/api","version":"0.1.0","type":"module","private":true,"scripts":{"dev":"tsx src/server.ts"}}
+{"name":"@shade/api","version":"0.1.0","type":"module","private":true,"scripts":{"dev":"tsx src/server.ts"},"dependencies":{"tweetnacl":"^1.0.3"}}

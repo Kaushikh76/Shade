@@ -21,6 +21,7 @@ coverage/
 *.sqlite
 *.sqlite-*
 target/
+test_snapshots/
 
 # --- ZK artifacts (large / regenerated; keys are sensitive) ---
 *.wasm

@@ -12,20 +12,32 @@ include "poseidon.circom";
 // in-circuit: value_in == value_out + fee. This is the Zcash/Penumbra-style
 // shielded transfer the bible specifies (PrivateTransfer circuit).
 //
+// P2 #14: prior versions of this circuit had NO ASP binding at all — funds
+// could move inside the pool completely outside the compliance envelope that
+// deposit/withdraw enforce. This now requires the same hard-equality
+// allow-set membership check as withdraw_public (#4): the spender's label
+// must be a leaf in the association tree. Deny-root NON-membership is a
+// separate, larger piece of work (needs a sorted deny-tree + an in-circuit
+// exclusion proof, plus off-chain tooling to build/serve one) — see
+// circuits/compliance_membership/README.md for the scoped follow-up design;
+// it is intentionally not attempted here alongside an unrelated allow-check.
+//
 // Public signals (after the output):
-//   [0] nullifierHash   (domain-separated input nullifier, #3)
+//   [0] nullifierHash    (domain-separated input nullifier, #3)
 //   [1] outputCommitment (new note; hides value_out)
-//   [2] feePublic       (fee paid to relayer, public)
-//   [3] stateRoot       (input note membership)
-//   [4] poolId          (#3)
-//   [5] chainId         (#3)
-template PrivateTransfer(treeDepth) {
+//   [2] feePublic        (fee paid to relayer, public)
+//   [3] stateRoot        (input note membership)
+//   [4] associationRoot  (ASP allowlist root; spender's label must be a member)
+//   [5] poolId           (#3)
+//   [6] chainId          (#3)
+template PrivateTransfer(treeDepth, associationDepth) {
     // PUBLIC
     signal input outputCommitment;  // [1]
     signal input feePublic;         // [2]
     signal input stateRoot;         // [3]
-    signal input poolId;            // [4]
-    signal input chainId;           // [5]
+    signal input associationRoot;   // [4]
+    signal input poolId;            // [5]
+    signal input chainId;           // [6]
 
     // PRIVATE — input note
     signal input inValue;
@@ -34,6 +46,8 @@ template PrivateTransfer(treeDepth) {
     signal input inSecret;
     signal input stateSiblings[treeDepth];
     signal input stateIndex;
+    signal input labelIndex;
+    signal input labelSiblings[associationDepth];
 
     // PRIVATE — output note
     signal input outValue;
@@ -83,6 +97,16 @@ template PrivateTransfer(treeDepth) {
     component feeRange = Num2Bits(128);
     feeRange.in <== feePublic;
     _ <== feeRange.out;
+
+    // 6) P2 #14 ENFORCED association-set membership: the spender's label must
+    // be in the association tree (hard equality, no zero-bypass) — matches
+    // withdraw_public's #4 check so transfers are held to the same compliance
+    // envelope as deposit/withdraw.
+    component associationRootChecker = MerkleProof(associationDepth);
+    associationRootChecker.leaf <== inLabel;
+    associationRootChecker.leafIndex <== labelIndex;
+    associationRootChecker.siblings <== labelSiblings;
+    associationRoot === associationRootChecker.out;
 }
 
-component main {public [outputCommitment, feePublic, stateRoot, poolId, chainId]} = PrivateTransfer(12);
+component main {public [outputCommitment, feePublic, stateRoot, associationRoot, poolId, chainId]} = PrivateTransfer(12, 2);

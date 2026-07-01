@@ -44,7 +44,18 @@ const STELLAR_CCTP_DOMAIN: i128 = 27; // C6: inbound deposits must target the St
 // nullifier spend, fund release) remain fully on-chain; only root *computation*
 // is off-chain, which is acceptable pre-MPC/TEE and documented in docs/.
 const TREE_ROOT_KEY: Symbol = symbol_short!("root");
-const LEAVES_KEY: Symbol = symbol_short!("leaves");
+// P3 #19: leaves are NOT stored as an on-chain Vec<BytesN<32>> — that vector
+// was rewritten in full on every single deposit/transfer/settle (O(n) cost
+// per op) and grows without bound toward the Soroban ledger-entry size limit.
+// Since root computation is off-chain anyway (see above) the vector was pure
+// auditability bloat with no cryptographic role; every insertion site already
+// emits the commitment via `env.events().publish(...)`, so full off-chain
+// reconstruction was always possible from events. LEAF_COUNT_KEY is just a
+// cheap O(1) counter for `get_leaf_count()` / computing the next leaf_index.
+// NOTE: upgrading an already-deployed pool from the old Vec-based storage
+// needs a one-time migration (seed LEAF_COUNT_KEY from the old vector's
+// length) — not needed for a fresh deploy.
+const LEAF_COUNT_KEY: Symbol = symbol_short!("leafcnt");
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -77,6 +88,7 @@ pub enum Error {
     MpcUnknownSigner = 25,  // Phase 8: a provided signer pubkey is not in the registered committee
     MpcProofInvalid = 26,   // Phase C: mpc_settlement ZK proof failed verification
     MpcSignalMismatch = 27, // Phase C: proof public signal != provided argument
+    MpcDuplicateSigner = 28,// Phase 8: the same committee pubkey appears more than once in signer_pubkeys
 }
 
 const ADMIN: Symbol = symbol_short!("admin");
@@ -130,7 +142,7 @@ impl ShieldedPool {
         let _ = depth;
         let empty_root = BytesN::from_array(&env, &[0u8; 32]);
         env.storage().instance().set(&TREE_ROOT_KEY, &empty_root);
-        env.storage().instance().set(&LEAVES_KEY, &Vec::<BytesN<32>>::new(&env));
+        env.storage().instance().set(&LEAF_COUNT_KEY, &0u32);
         env.storage().persistent().set(&DataKey::KnownRoot(empty_root), &true);
     }
 
@@ -239,10 +251,8 @@ impl ShieldedPool {
             panic_err(&env, Error::ProofInvalid);
         }
 
-        let mut leaves: Vec<BytesN<32>> = env.storage().instance().get(&LEAVES_KEY).unwrap_or(Vec::new(&env));
-        let leaf_index = leaves.len();
-        leaves.push_back(commitment.clone());
-        env.storage().instance().set(&LEAVES_KEY, &leaves);
+        let leaf_index: u32 = env.storage().instance().get(&LEAF_COUNT_KEY).unwrap_or(0u32);
+        env.storage().instance().set(&LEAF_COUNT_KEY, &(leaf_index + 1));
         env.storage().instance().set(&TREE_ROOT_KEY, &new_root);
         env.storage().persistent().set(&DataKey::KnownRoot(new_root.clone()), &true);
         env.storage().persistent().set(&DataKey::Deposit(cctp_nonce.clone()), &true);
@@ -359,7 +369,8 @@ impl ShieldedPool {
     /// commitment and public fee, never the transferred amount. No public funds move.
     ///
     /// PrivateTransfer public signals:
-    ///   [0]=nullifierHash [1]=outputCommitment [2]=feePublic [3]=stateRoot [4]=poolId [5]=chainId
+    ///   [0]=nullifierHash [1]=outputCommitment [2]=feePublic [3]=stateRoot
+    ///   [4]=associationRoot [5]=poolId [6]=chainId
     pub fn private_transfer_settle(env: Env, proof_bytes: Bytes, pub_signals_bytes: Bytes, new_root: BytesN<32>) {
         Self::require_not_paused(&env);
         Self::require_admin(&env); // registrar submits the off-chain-computed new_root
@@ -368,9 +379,17 @@ impl ShieldedPool {
         let nullifier_hash: BytesN<32> = signals.get(0).unwrap();
         let output_commitment: BytesN<32> = signals.get(1).unwrap();
         let state_root: BytesN<32> = signals.get(3).unwrap();
-        // #3 domain check (no ASP binding in the transfer circuit).
-        let pool_in: i128 = fr32_to_i128(&signals.get(4).unwrap());
-        let chain_in: i128 = fr32_to_i128(&signals.get(5).unwrap());
+        // P2 #14: transfers are now held to the same ASP allowlist envelope as
+        // deposit/withdraw (a prior version had no association-root check at
+        // all here). Deny-root non-membership is not yet enforced anywhere in
+        // the protocol — see circuits/compliance_membership/README.md.
+        let assoc_in: BytesN<32> = signals.get(4).unwrap();
+        let assoc_expected: BytesN<32> = env.storage().instance().get(&ASSOCROOT).unwrap_or(BytesN::from_array(&env, &[0u8; 32]));
+        if assoc_in != assoc_expected {
+            panic_err(&env, Error::WrongAssociation);
+        }
+        let pool_in: i128 = fr32_to_i128(&signals.get(5).unwrap());
+        let chain_in: i128 = fr32_to_i128(&signals.get(6).unwrap());
         let pool_id: u32 = env.storage().instance().get(&POOLID).unwrap();
         let chain_id: u32 = env.storage().instance().get(&CHAINID).unwrap();
         if pool_in != pool_id as i128 || chain_in != chain_id as i128 {
@@ -400,10 +419,8 @@ impl ShieldedPool {
         );
 
         // Insert the output commitment (new note); registrar supplies the new root.
-        let mut leaves: Vec<BytesN<32>> = env.storage().instance().get(&LEAVES_KEY).unwrap_or(Vec::new(&env));
-        let leaf_index = leaves.len();
-        leaves.push_back(output_commitment.clone());
-        env.storage().instance().set(&LEAVES_KEY, &leaves);
+        let leaf_index: u32 = env.storage().instance().get(&LEAF_COUNT_KEY).unwrap_or(0u32);
+        env.storage().instance().set(&LEAF_COUNT_KEY, &(leaf_index + 1));
         env.storage().instance().set(&TREE_ROOT_KEY, &new_root);
         env.storage().persistent().set(&DataKey::KnownRoot(new_root.clone()), &true);
 
@@ -725,7 +742,10 @@ impl ShieldedPool {
 
         // Verify each provided signature against the registered committee set.
         // ed25519_verify panics if the signature is invalid, aborting the whole tx.
+        // Duplicate signer pubkeys are rejected outright — a replayed/duplicated
+        // signature from one key must never count twice toward the threshold.
         let msg = Bytes::from_array(&env, &batch_hash.to_array());
+        let mut seen: Vec<BytesN<32>> = Vec::new(&env);
         let mut verified: u32 = 0;
         for i in 0..signer_pubkeys.len() {
             let pk: BytesN<32> = signer_pubkeys.get(i).unwrap();
@@ -740,6 +760,12 @@ impl ShieldedPool {
             if !registered {
                 panic_err(&env, Error::MpcUnknownSigner);
             }
+            for j in 0..seen.len() {
+                if seen.get(j).unwrap() == pk {
+                    panic_err(&env, Error::MpcDuplicateSigner);
+                }
+            }
+            seen.push_back(pk.clone());
             let sig: BytesN<64> = signatures.get(i).unwrap();
             env.crypto().ed25519_verify(&pk, &msg, &sig);
             verified += 1;
@@ -822,6 +848,14 @@ impl ShieldedPool {
             vec![&env, env.current_contract_address().to_val(), nullifier_b.clone().to_val()],
         );
 
+        // P1 #9 / P3 #19: account for both output commitments (mirrors deposit
+        // and private-transfer) so leaf_index/leaf_count stay in sync with the
+        // off-chain tree — otherwise the lineage diverges after the first MPC
+        // settlement. Commitments themselves are emitted via the event below,
+        // not stored on-chain (see LEAF_COUNT_KEY note above).
+        let leaf_count: u32 = env.storage().instance().get(&LEAF_COUNT_KEY).unwrap_or(0u32);
+        env.storage().instance().set(&LEAF_COUNT_KEY, &(leaf_count + 2));
+
         // Record the new Merkle root (includes both output commitments inserted off-chain).
         env.storage().persistent().set(&DataKey::KnownRoot(new_root.clone()), &true);
         env.storage().instance().set(&TREE_ROOT_KEY, &new_root);
@@ -842,8 +876,7 @@ impl ShieldedPool {
     }
 
     pub fn get_leaf_count(env: Env) -> u32 {
-        let leaves: Vec<BytesN<32>> = env.storage().instance().get(&LEAVES_KEY).unwrap_or(Vec::new(&env));
-        leaves.len()
+        env.storage().instance().get(&LEAF_COUNT_KEY).unwrap_or(0u32)
     }
 
     pub fn usdc_balance(env: Env) -> i128 {
@@ -863,6 +896,16 @@ impl ShieldedPool {
     pub fn unpause(env: Env) {
         Self::require_admin(&env);
         env.storage().instance().set(&PAUSED, &false);
+    }
+
+    /// P3 #20: move admin authority to a GovernanceGuardian contract so
+    /// `upgrade()` (and every other admin-gated function) is bound by its
+    /// quorum + timelock instead of a single key. Same-key-as-before is also
+    /// valid (transferring to another plain account) — this is a generic
+    /// "rotate admin" primitive, not guardian-specific.
+    pub fn transfer_admin(env: Env, new_admin: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&ADMIN, &new_admin);
     }
 
     fn require_admin(env: &Env) {
@@ -953,3 +996,5 @@ fn fr32_to_i128(b: &BytesN<32>) -> i128 {
     lo.copy_from_slice(&arr[16..32]);
     u128::from_be_bytes(lo) as i128
 }
+
+mod tests;

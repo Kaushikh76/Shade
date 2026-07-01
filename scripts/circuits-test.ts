@@ -22,10 +22,12 @@ try {
 } catch (e) { checks.push({ name: "withdraw_public proof verifies", ok: false, detail: (e as Error).message.slice(0, 160) }); }
 
 try {
-  // private_transfer: spend input note, create output note, public fee.
+  // private_transfer: spend input note, create output note, public fee, ASP allow-set membership.
   const tc = generateCoin("ctest_xfer", `${SCRATCH}/ctest_x.json`);
-  const tproof = buildTransferProof(tc, [tc.commitmentDecimal], "ctest_xfer", "100000", SCRATCH, "ctest_x");
+  const tassoc = buildAssociationSet(tc, SCRATCH, "ctest_x");
+  const tproof = buildTransferProof(tc, [tc.commitmentDecimal], "ctest_xfer", "100000", SCRATCH, "ctest_x", tassoc.assocPath);
   checks.push({ name: "private_transfer proof verifies", ok: tproof.locallyVerified, detail: tproof.locallyVerified ? "OK" : "verify FAILED" });
+  checks.push({ name: "private_transfer ASP binding matches", ok: tproof.associationRootHex.toLowerCase() === tassoc.rootHex.toLowerCase(), detail: tproof.associationRootHex });
 } catch (e) { checks.push({ name: "private_transfer proof verifies", ok: false, detail: (e as Error).message.slice(0, 160) }); }
 
 try {

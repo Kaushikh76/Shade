@@ -27,7 +27,7 @@ export type IntentParams = {
   inputAsset: string;
   outputAsset: string;
   amountMode: "exact_in" | "exact_out" | "max_in";
-  amount7dp: string;           // input amount 7dp — used only by submit(); not sent to API
+  amount7dp: string;           // plaintext 7dp or amount_commitment when built via buildPrivateIntent()
   minOutput7dp: string;
   expiryLedger: number;
   noteCommitment: string;      // 0x.. Poseidon commitment of the deposited input note

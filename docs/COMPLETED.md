@@ -129,6 +129,13 @@ Full transaction log: [docs/testnet-transactions.md](testnet-transactions.md)
 
 ## MPC Implementation (completed 2026-06-30)
 
+> **P2 #16 caveat (2026-07):** "MPC" here names the settlement mechanism, not
+> a privacy guarantee — the coordinator reconstructs plaintext amounts to run
+> matching (see `coordinator.ts::runMatchingRound` and docs/PENDING.md). It is
+> Shamir-share transport into a trusted matcher, not multi-party computation
+> that keeps amounts hidden from every party. Settlement itself IS proof-backed
+> and threshold-enforced with distinct signers (P0 #1/#2/#3).
+
 ### Crypto (`packages/mpc-crypto`)
 - `shamirSplit` / `shamirReconstruct` — Shamir over BN254 scalar field
 - `encryptShareForNode` / `decryptShare` — X25519 ECDH + NaCl box

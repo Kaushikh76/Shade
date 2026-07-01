@@ -110,7 +110,11 @@ export function computeBatchHash(batchId: string, matches: MatchResult[]): strin
     batchId,
     matches: matches
       .map(m => ({ a: m.intentAId, b: m.intentBId, amt: m.matchedAmount7dp, in: m.inputAsset, out: m.outputAsset }))
-      .sort((a, b) => a.a < b.a ? -1 : 1)
+      // Total order, tie-broken down to `b`: a comparator that never returns 0
+      // is not a valid total order and can sort ties differently across JS
+      // engines/versions, producing a non-deterministic batchHash for the
+      // same logical match set.
+      .sort((a, b) => a.a === b.a ? (a.b < b.b ? -1 : a.b > b.b ? 1 : 0) : (a.a < b.a ? -1 : 1))
   });
   return createHash("sha256").update(canonical).digest("hex");
 }
@@ -143,12 +147,19 @@ export function verifyNodeSignature(
   return nacl.sign.detached.verify(new Uint8Array(msg), new Uint8Array(signature), new Uint8Array(pk));
 }
 
-/** Verify that a signed batch has valid signatures from the expected committee. */
+/**
+ * Verify that a signed batch has valid signatures from the expected committee.
+ * Threshold is counted over DISTINCT signer pubkeys — a repeated/replayed signature
+ * from the same key must not count twice toward the threshold.
+ */
 export function verifySignedBatch(batch: SignedMatchBatch, committee: CommitteeNodeInfo[]): boolean {
   const expectedPubkeys = new Set(committee.map(n => n.signingPubkey));
+  const seenSigners = new Set<string>();
   for (const sig of batch.signatures) {
     if (!expectedPubkeys.has(sig.signingPubkey)) return false;
+    if (seenSigners.has(sig.signingPubkey)) return false; // duplicate signer — reject the whole batch
     if (!verifyNodeSignature(batch.batchId, batch.matches, sig)) return false;
+    seenSigners.add(sig.signingPubkey);
   }
-  return batch.signatures.length >= Math.ceil(committee.length * 2 / 3);
+  return seenSigners.size >= Math.ceil(committee.length * 2 / 3);
 }

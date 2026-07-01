@@ -440,4 +440,67 @@ export class Store {
     if (!allowed.has(table)) return;
     await this.pool.query(`update ${table} set user_id=$2 where ${idColumn}=$1`, [id, userId]);
   }
+
+  // P2 #13 Shade View: fetch only the settlements/commitments the user owns —
+  // silently drops ids that don't belong to them or don't exist, rather than
+  // erroring, so a report never leaks another user's data through an id guess.
+  async getOwnedSettlements(userId: string, settlementIds: string[]): Promise<Array<Record<string, unknown>>> {
+    if (settlementIds.length === 0) return [];
+    const { rows } = await this.pool.query(
+      `select settlement_id, intent_hash, quote_id, nullifier, stellar_tx_hash, state, created_at
+       from settlements where user_id=$1 and settlement_id = ANY($2)`,
+      [userId, settlementIds]
+    );
+    return rows;
+  }
+
+  async getOwnedNoteCommitments(userId: string, commitments: string[]): Promise<Array<Record<string, unknown>>> {
+    if (commitments.length === 0) return [];
+    const { rows } = await this.pool.query(
+      `select commitment, policy_id, amount_usdc_7dp, status, created_at
+       from note_commitments where user_id=$1 and commitment = ANY($2)`,
+      [userId, commitments]
+    );
+    return rows;
+  }
+
+  // Anchor transaction ids linked to the given settlements (SEP-31 payout id).
+  async getAnchorIdsForSettlements(settlementIds: string[]): Promise<string[]> {
+    if (settlementIds.length === 0) return [];
+    const { rows } = await this.pool.query<{ anchor_transaction_id: string }>(
+      `select distinct anchor_transaction_id from anchor_payouts
+       where settlement_id = ANY($1) and anchor_transaction_id is not null`,
+      [settlementIds]
+    );
+    return rows.map(r => r.anchor_transaction_id);
+  }
+
+  async insertViewKeyReport(row: {
+    reportId: string; userId: string; timeRangeFrom?: string; timeRangeTo?: string;
+    noteCommitments: string[]; disclosedNullifiers: string[]; quoteId?: string;
+    policyId?: string; anchorId?: string; amountDisclosed: boolean; proofLinks: string[];
+    servicePubkey: string; serviceSignature: string; encryptedAttachment?: unknown;
+  }): Promise<void> {
+    await this.pool.query(
+      `insert into view_key_reports
+         (report_id, user_id, time_range_from, time_range_to, note_commitments, disclosed_nullifiers,
+          quote_id, policy_id, anchor_id, amount_disclosed, proof_links, service_pubkey, service_signature, encrypted_attachment)
+       values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+      [
+        row.reportId, row.userId, row.timeRangeFrom ?? null, row.timeRangeTo ?? null,
+        JSON.stringify(row.noteCommitments), JSON.stringify(row.disclosedNullifiers),
+        row.quoteId ?? null, row.policyId ?? null, row.anchorId ?? null, row.amountDisclosed,
+        JSON.stringify(row.proofLinks), row.servicePubkey, row.serviceSignature,
+        row.encryptedAttachment ? JSON.stringify(row.encryptedAttachment) : null
+      ]
+    );
+  }
+
+  async getViewKeyReport(userId: string, reportId: string): Promise<Record<string, unknown> | null> {
+    const { rows } = await this.pool.query(
+      "select * from view_key_reports where report_id=$1 and user_id=$2",
+      [reportId, userId]
+    );
+    return rows[0] ?? null;
+  }
 }

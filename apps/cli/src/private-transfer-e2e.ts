@@ -4,7 +4,7 @@ import { loadRuntimeEnv, requireKeys } from "./lib/env.js";
 import { failIfAny, writeCheckReport, type CheckResult } from "./lib/report.js";
 import { runCctpInbound } from "./lib/cctp-inbound.js";
 import { sorobanInvoke, bytesToCliHex } from "@shade/stellar-utils";
-import { generateCoin, computeStateRoot, buildTransferProof } from "./lib/prove.js";
+import { generateCoin, computeStateRoot, buildTransferProof, buildAssociationSet } from "./lib/prove.js";
 
 // #2 Hidden-amount PrivateTransfer e2e:
 //   fund an input note -> prove a transfer (input -> output note + public fee,
@@ -45,20 +45,27 @@ const inbound = await runCctpInbound(env, {
 });
 results.push({ name: "input note funded (CCTP)", ok: true, detail: `leaf ${inbound.leafIndex}` });
 
-// 2) Build the transfer proof (fee public, amounts hidden).
+// 2) P2 #14: register the input note's label in the ASP allow-set and bind
+// the pool's associationRoot to it, so the transfer proof (and every other
+// note operation) is held to the same compliance envelope as withdraw.
+const assoc = buildAssociationSet(coin, SCRATCH, "pt");
+sorobanInvoke({ contractId: pool, secret: poolAdminSecret, method: "set_association_root", args: ["--association_root", bytesToCliHex(assoc.rootHex)], rpcUrl: rpc, passphrase: pass });
+
+// 3) Build the transfer proof (fee public, amounts hidden).
 const fee = process.env.PT_FEE_7DP ?? "200000"; // 0.02 USDC public fee
-const xfer = buildTransferProof(coin, [coin.commitmentDecimal], "shade_xfer", fee, SCRATCH, "pt");
+const xfer = buildTransferProof(coin, [coin.commitmentDecimal], "shade_xfer", fee, SCRATCH, "pt", assoc.assocPath);
+results.push({ name: "transfer proof: ASP allow-set membership enforced", ok: xfer.associationRootHex.toLowerCase() === assoc.rootHex.toLowerCase(), detail: `associationRoot ${xfer.associationRootHex}` });
 results.push({ name: "transfer proof: amounts hidden (only fee public)", ok: xfer.locallyVerified, detail: `fee ${xfer.feePublic} public; in/out values NOT in public signals; out note hidden` });
 const rootMatch = xfer.stateRootHex.toLowerCase() === ("0x" + poolRead("get_root").toLowerCase());
 results.push({ name: "circuit stateRoot == on-chain root", ok: rootMatch, detail: rootMatch ? "match" : `${xfer.stateRootHex} vs 0x${poolRead("get_root")}` });
 
-// 3) Compute the post-insert root for the output commitment (off-chain registrar).
+// 4) Compute the post-insert root for the output commitment (off-chain registrar).
 //    Tree after the transfer = [input commitment, output commitment].
 const outputCommitmentDecimal = JSON.parse(readFileSync(`${SCRATCH}/pt_xfer.json`, "utf8")).outputCommitment as string;
 const leavesAfter = [coin.commitmentDecimal, outputCommitmentDecimal];
 const outRoot = computeStateRoot(coin, leavesAfter, "shade_xfer", SCRATCH, "pt_out");
 
-// 4) Settle the transfer on-chain: verify + spend input nullifier + insert output commitment.
+// 5) Settle the transfer on-chain: verify + spend input nullifier + insert output commitment.
 sleepSync(4000);
 const settle = sorobanInvoke({
   contractId: pool, secret: poolAdminSecret, method: "private_transfer_settle",
@@ -67,7 +74,7 @@ const settle = sorobanInvoke({
 });
 results.push({ name: "on-chain transfer settle (verify + nullifier + output commitment)", ok: !!settle.txHash, detail: settle.txHash });
 
-// 5) Double-spend: re-submitting the same transfer must fail (input nullifier spent).
+// 6) Double-spend: re-submitting the same transfer must fail (input nullifier spent).
 //    Wait for the spend to propagate to the read node before re-attempting.
 sleepSync(12000);
 let dsRejected = false;

@@ -39,7 +39,24 @@ async function fetchIntentNote(pool: pg.Pool, intentId: string): Promise<IntentR
   return rows[0] ?? null;
 }
 
-// One MPC_SETTLE_SUBMIT job per match in a batch.
+// P0 #4: an MPC-matched intent is reachable by two settlement paths — the
+// proof-backed POST /v1/rfq/settle lifecycle, and this settler's mpc_settle
+// path. Both spend the same nullifiers, so they must be mutually exclusive
+// per intent. Phase A routes every RFQ intent through the committee by giving
+// it a row in `intents` (intent_hash = mpc_intents.intent_id, see migration
+// 011); those intents settle ONLY via rfq_settle, driven by the RFQ lifecycle
+// (accept -> lock -> fill -> settle), never by this settler. Only intents
+// submitted directly to POST /v1/mpc/intents (no `intents` row — pure
+// crossing-settlement, no RFQ wrapper) are this settler's to settle.
+async function isRfqRouted(pool: pg.Pool, intentId: string): Promise<boolean> {
+  const { rows } = await pool.query(
+    "SELECT 1 FROM intents WHERE intent_hash = $1",
+    [intentId]
+  );
+  return rows.length > 0;
+}
+
+// One MPC_SETTLE_SUBMIT job per non-RFQ-routed match in a batch.
 // Includes full note data so the relayer can construct the on-chain call.
 async function queueSettlementJobs(queue: JobQueue, pool: pg.Pool, batch: BatchRow): Promise<void> {
   const matches: MatchRow[] = Array.isArray(batch.matches_json)
@@ -50,9 +67,23 @@ async function queueSettlementJobs(queue: JobQueue, pool: pg.Pool, batch: BatchR
     ? batch.signatures_json
     : (batch.signatures_json as unknown as string[]).map(s => JSON.parse(String(s)));
 
+  let queued = 0;
+  let skipped = 0;
+
   for (let i = 0; i < matches.length; i++) {
     const m = matches[i];
     const idempotencyKey = `mpc_settle:${batch.batch_id}:${i}`;
+
+    // Skip any match where either side belongs to the RFQ lifecycle — it
+    // settles exclusively via rfq_settle, never via this path.
+    const [aRfqRouted, bRfqRouted] = await Promise.all([
+      isRfqRouted(pool, m.intentAId),
+      isRfqRouted(pool, m.intentBId)
+    ]);
+    if (aRfqRouted || bRfqRouted) {
+      skipped++;
+      continue;
+    }
 
     // Fetch note data for both sides of the match.
     const [noteA, noteB] = await Promise.all([
@@ -83,13 +114,20 @@ async function queueSettlementJobs(queue: JobQueue, pool: pg.Pool, batch: BatchR
       },
       idempotencyKey
     );
+    queued++;
   }
 
+  // A batch settles fully via mpc_settle (all matches queued), fully via the
+  // RFQ lifecycle (all matches skipped), or — if a session ever mixes both
+  // kinds of intents — partially. Only mark 'queued' if this settler actually
+  // has work left to do; an all-RFQ batch is marked 'rfq_routed' so it stops
+  // showing up in the 'pending' poll.
+  const newStatus = queued > 0 ? "queued" : "rfq_routed";
   await pool.query(
-    "UPDATE mpc_batches SET settlement_status='queued', updated_at=now() WHERE batch_id=$1",
-    [batch.batch_id]
+    "UPDATE mpc_batches SET settlement_status=$2, updated_at=now() WHERE batch_id=$1",
+    [batch.batch_id, newStatus]
   );
-  console.log(`[settler] batch ${batch.batch_id}: ${matches.length} match(es) queued for settlement`);
+  console.log(`[settler] batch ${batch.batch_id}: ${queued} match(es) queued for mpc_settle, ${skipped} skipped (RFQ-routed)`);
 }
 
 // Poll once for pending signed batches and dispatch settlement jobs.

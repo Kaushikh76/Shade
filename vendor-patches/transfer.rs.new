@@ -2,7 +2,7 @@ use crate::{
     config::{CHAIN_ID, POOL_ID, TREE_DEPTH},
     crypto::{coin::generate_commitment, coin::generate_label, conversions::*},
     error::{CoinUtilsError, Result},
-    types::{CoinData, GeneratedCoin, StateFile},
+    types::{AssociationSetFile, CoinData, GeneratedCoin, StateFile},
 };
 use lean_imt::LeanIMT;
 use rand::{thread_rng, Rng};
@@ -19,6 +19,13 @@ pub struct TransferInput {
     pub fee_public: String,
     #[serde(rename = "stateRoot")]
     pub state_root: String,
+    // P2 #14: ASP allow-set membership (associationRoot pass/fail is a hard
+    // equality in-circuit — see circuits/private_transfer/main.circom). Without
+    // an association set file, dummy values are used and the proof will only
+    // verify against an on-chain associationRoot of 0, i.e. compliance
+    // disabled — same convention as withdraw_public's Option<AssociationSetFile>.
+    #[serde(rename = "associationRoot")]
+    pub association_root: String,
     #[serde(rename = "poolId")]
     pub pool_id: String,
     #[serde(rename = "chainId")]
@@ -36,6 +43,10 @@ pub struct TransferInput {
     pub state_siblings: Vec<String>,
     #[serde(rename = "stateIndex")]
     pub state_index: String,
+    #[serde(rename = "labelIndex")]
+    pub label_index: String,
+    #[serde(rename = "labelSiblings")]
+    pub label_siblings: Vec<String>,
     // private — output note
     #[serde(rename = "outValue")]
     pub out_value: String,
@@ -57,6 +68,11 @@ impl TransferManager {
     /// Build a PrivateTransfer witness: spend `coin` (input note) and create a new
     /// output note of value (input - fee). Amounts stay private; only the output
     /// commitment and public fee are revealed. Returns (witness, output coin).
+    ///
+    /// P2 #14: `association_set_file`, when provided, proves the input note's
+    /// label is a member of the ASP allow-set (mirrors WithdrawalManager's
+    /// handle_association_set exactly, so the association tree construction is
+    /// identical between withdraw and transfer).
     pub fn build_transfer(
         &self,
         env: &Env,
@@ -64,6 +80,7 @@ impl TransferManager {
         state_file: &StateFile,
         fee_decimal: &str,
         out_scope: &[u8],
+        association_set_file: Option<&AssociationSetFile>,
     ) -> Result<(TransferInput, GeneratedCoin)> {
         // --- input note ---
         let in_value = decimal_string_to_bls_scalar(env, &coin.value)?;
@@ -86,6 +103,18 @@ impl TransferManager {
         let (siblings, _d) = tree.generate_proof(idx as u32).ok_or(CoinUtilsError::ProofGenerationFailed)?;
         let state_root = lean_imt::bytes_to_bls_scalar(&tree.get_root());
 
+        // P2 #14: ASP allow-set membership proof for the spender's label.
+        let (association_root, label_index, label_siblings) =
+            if let Some(association_set) = association_set_file {
+                self.handle_association_set(env, association_set, &in_label)?
+            } else {
+                (
+                    "0".to_string(),
+                    "0".to_string(),
+                    vec!["0".to_string(), "0".to_string()],
+                )
+            };
+
         // --- output note (value = in - fee), fresh nullifier/secret/label ---
         let fee = decimal_string_to_bls_scalar(env, fee_decimal)?;
         // out_value = in_value - fee (compute on big integers via decimal strings)
@@ -102,12 +131,13 @@ impl TransferManager {
         let out_label = generate_label(env, out_scope, &nonce);
         let out_commitment = generate_commitment(env, out_value.clone(), out_label.clone(), out_nullifier.clone(), out_secret.clone());
 
-        let _ = (in_label.clone(), fee.clone());
+        let _ = fee.clone();
 
         let witness = TransferInput {
             output_commitment: bls_scalar_to_decimal_string(&out_commitment),
             fee_public: fee_decimal.to_string(),
             state_root: bls_scalar_to_decimal_string(&state_root),
+            association_root,
             pool_id: POOL_ID.to_string(),
             chain_id: CHAIN_ID.to_string(),
             in_value: coin.value.clone(),
@@ -116,6 +146,8 @@ impl TransferManager {
             in_secret: coin.secret.clone(),
             state_siblings: siblings.iter().map(|s| bls_scalar_to_decimal_string(&s.clone())).collect(),
             state_index: idx.to_string(),
+            label_index,
+            label_siblings,
             out_value: out_u.to_string(),
             out_label: bls_scalar_to_decimal_string(&out_label),
             out_nullifier: bls_scalar_to_decimal_string(&out_nullifier),
@@ -134,6 +166,53 @@ impl TransferManager {
         };
 
         Ok((witness, out_coin))
+    }
+
+    /// Association-set membership proof for `label`. Identical construction to
+    /// WithdrawalManager::handle_association_set (same tree depth, same hashing)
+    /// so a label's proof is valid regardless of which flow builds it.
+    fn handle_association_set(
+        &self,
+        env: &Env,
+        association_set: &AssociationSetFile,
+        label: &BlsScalar,
+    ) -> Result<(String, String, Vec<String>)> {
+        use crate::config::ASSOCIATION_TREE_DEPTH;
+
+        let mut association_tree = LeanIMT::new(env, ASSOCIATION_TREE_DEPTH);
+        let mut label_index = None;
+
+        for (index, label_str) in association_set.labels.iter().enumerate() {
+            let label_fr = decimal_string_to_bls_scalar(env, label_str).map_err(|e| {
+                CoinUtilsError::InvalidDecimal(format!(
+                    "Invalid association label at index {}: {}",
+                    index, e
+                ))
+            })?;
+            let label_bytes = lean_imt::bls_scalar_to_bytes(label_fr.clone());
+            association_tree.insert(label_bytes)?;
+            if label_fr == *label {
+                label_index = Some(index);
+            }
+        }
+
+        let label_index = label_index.ok_or(CoinUtilsError::LabelNotFound)?;
+
+        let association_proof = association_tree
+            .generate_proof(label_index as u32)
+            .ok_or(CoinUtilsError::ProofGenerationFailed)?;
+        let (association_siblings_scalars, _depth) = association_proof;
+
+        let association_root_scalar = lean_imt::bytes_to_bls_scalar(&association_tree.get_root());
+
+        Ok((
+            bls_scalar_to_decimal_string(&association_root_scalar),
+            label_index.to_string(),
+            association_siblings_scalars
+                .into_iter()
+                .map(|s| bls_scalar_to_decimal_string(&s))
+                .collect(),
+        ))
     }
 }
 

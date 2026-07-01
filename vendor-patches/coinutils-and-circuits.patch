@@ -1,5 +1,5 @@
 diff --git a/privacy-pools/cli/coinutils/src/cli/args.rs b/privacy-pools/cli/coinutils/src/cli/args.rs
-index 440aa84..17a789f 100644
+index 440aa84..c3f02b0 100644
 --- a/privacy-pools/cli/coinutils/src/cli/args.rs
 +++ b/privacy-pools/cli/coinutils/src/cli/args.rs
 @@ -30,6 +30,39 @@ pub enum Commands {
@@ -42,7 +42,7 @@ index 440aa84..17a789f 100644
      },
      /// Update association set
      UpdateAssociation {
-@@ -38,6 +71,29 @@ pub enum Commands {
+@@ -38,6 +71,32 @@ pub enum Commands {
          /// Label to add
          label: String,
      },
@@ -59,6 +59,9 @@ index 440aa84..17a789f 100644
 +        state_file: String,
 +        /// Public fee (7dp), output value = input value - fee
 +        fee: String,
++        /// Association set file path (optional; ASP allow-set membership, P2 #14)
++        #[arg(long)]
++        association_file: Option<String>,
 +        /// Output scope for the new note
 +        #[arg(long, default_value = "shade_transfer_out")]
 +        out_scope: String,
@@ -73,7 +76,7 @@ index 440aa84..17a789f 100644
  
  impl Cli {
 diff --git a/privacy-pools/cli/coinutils/src/cli/commands.rs b/privacy-pools/cli/coinutils/src/cli/commands.rs
-index 92bf7f3..22ce254 100644
+index 92bf7f3..83665a5 100644
 --- a/privacy-pools/cli/coinutils/src/cli/commands.rs
 +++ b/privacy-pools/cli/coinutils/src/cli/commands.rs
 @@ -57,12 +57,24 @@ impl CommandHandler {
@@ -129,7 +132,7 @@ index 92bf7f3..22ce254 100644
  
          // Save withdrawal data
          let withdrawal_json = self
-@@ -125,6 +151,50 @@ impl CommandHandler {
+@@ -125,6 +151,63 @@ impl CommandHandler {
          println!("Association set updated successfully");
          Ok(())
      }
@@ -152,19 +155,32 @@ index 92bf7f3..22ce254 100644
 +        coin_file: String,
 +        state_file: String,
 +        fee: String,
++        association_file: Option<String>,
 +        out_scope: String,
 +        output: String,
 +        out_coin: String,
 +    ) -> Result<()> {
 +        info!("Building PrivateTransfer witness for coin: {}", coin_file);
++        debug!("Association file: {:?}", association_file);
 +        let env = Env::default();
 +        env.cost_estimate().budget().reset_unlimited();
 +
 +        let coin = self.file_manager.read_coin_file(&coin_file)?;
 +        let state = self.file_manager.read_state_file(&state_file)?;
++        let association_set_data = if let Some(assoc_file) = association_file {
++            Some(self.file_manager.read_association_file(&assoc_file)?)
++        } else {
++            None
++        };
 +        let manager = crate::merkle::transfer::TransferManager::new();
-+        let (witness, new_coin) =
-+            manager.build_transfer(&env, &coin.coin, &state, &fee, out_scope.as_bytes())?;
++        let (witness, new_coin) = manager.build_transfer(
++            &env,
++            &coin.coin,
++            &state,
++            &fee,
++            out_scope.as_bytes(),
++            association_set_data.as_ref(),
++        )?;
 +
 +        std::fs::write(&output, serde_json::to_string_pretty(&witness).map_err(crate::error::CoinUtilsError::Json)?)?;
 +        self.file_manager.write_coin_file(&new_coin, &out_coin)?;
@@ -198,10 +214,10 @@ index 2aff16c..2c76d4a 100644
 +pub const POOL_ID: &str = "1"; // Shade shielded pool v1
 +pub const CHAIN_ID: &str = "148"; // Stellar (SLIP-44 coin type), testnet domain marker
 diff --git a/privacy-pools/cli/coinutils/src/main.rs b/privacy-pools/cli/coinutils/src/main.rs
-index c920f69..836c018 100644
+index c920f69..5c64272 100644
 --- a/privacy-pools/cli/coinutils/src/main.rs
 +++ b/privacy-pools/cli/coinutils/src/main.rs
-@@ -17,11 +17,47 @@ fn main() {
+@@ -17,11 +17,48 @@ fn main() {
              state_file,
              association_file,
              output,
@@ -243,10 +259,11 @@ index c920f69..836c018 100644
 +            coin_file,
 +            state_file,
 +            fee,
++            association_file,
 +            out_scope,
 +            output,
 +            out_coin,
-+        } => command_handler.handle_transfer(coin_file, state_file, fee, out_scope, output, out_coin),
++        } => command_handler.handle_transfer(coin_file, state_file, fee, association_file, out_scope, output, out_coin),
      };
  
      if let Err(e) = result {

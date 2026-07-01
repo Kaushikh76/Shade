@@ -26,6 +26,32 @@ cargo build --release --bin stellar-coinutils
 - `transfer.rs` (new) + `args.rs` / `commands.rs` / `main.rs` / `merkle/mod.rs`
   — a `transfer` subcommand that builds the hidden-amount PrivateTransfer witness
   (#2): output note value = input − fee, value conservation, output commitment.
+  P2 #14 added an optional `--association-file` flag (mirrors `withdraw`'s) that
+  proves the spender's label is a member of the ASP allow-set, using the exact
+  same tree construction as `WithdrawalManager::handle_association_set` so a
+  label's proof is valid regardless of which flow builds it. Without the flag,
+  dummy values are used and the proof only verifies against an on-chain
+  `associationRoot` of 0 (compliance disabled) — same convention as withdraw.
+
+**Not locally build-verified**: this machine's Rust toolchain is broken for
+this dependency graph independent of these changes — confirmed two ways: (1)
+the default MSVC host's `link.exe` fails linking `serde`/`proc-macro2`/
+`typenum`'s build scripts on an untouched clone of this same commit; (2)
+explicitly forcing the GNU toolchain (`rustup run stable-x86_64-pc-windows-gnu
+cargo build`) instead fails on a missing `dlltool.exe` compiling `getrandom`.
+Neither is related to this patch. The locally pre-built `stellar-coinutils`
+binary in `.zk-ref/` therefore still reflects the PRE-P2-#14 source (no
+`--association-file` flag) — `npm run circuits:test` will fail on
+`private_transfer` locally until someone rebuilds it on a working toolchain.
+This does **not** affect CI/fresh clones: they build the binary from source
+following the steps above, which already includes this patch, so they get a
+correct, current build. The patch was verified to `git apply` cleanly against
+a fresh clone; the circuit side (`circuits/private_transfer/main.circom`) was
+independently rebuilt and verified here — `circuits:build` reports
+`nPublic=7` as expected and the trusted setup completed. Only the native
+`transfer.rs` change is unverified locally; its `handle_association_set`
+logic is a direct mirror of the proven, already-deployed one in
+`withdrawal.rs` (fetched from upstream to copy exactly).
 
 Shade's own circuits live in-repo under `circuits/withdraw_public/` and
 `circuits/private_transfer/` (the `.circom` sources). Only the upstream

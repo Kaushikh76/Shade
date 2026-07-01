@@ -55,7 +55,7 @@ function loadEnv(): EnvMap {
 
 // Compute lean-IMT Merkle root over all existing note_commitments + the two new
 // MPC output commitments, using the same coinutils binary as the root-auditor.
-// Falls back to a zeroed root only if the binary invocation itself fails.
+// Throws if the binary invocation fails — never silently returns a zero root.
 async function computeMpcRoot(
   queue: JobQueue,
   outCommitAHex: string,
@@ -90,12 +90,11 @@ async function computeMpcRoot(
   const statePath = resolve(scratchPath, `mpc_root_${Date.now()}.json`);
   writeFileSync(statePath, JSON.stringify({ commitments: leaves, scope: "mpc_settle" }));
 
-  try {
-    const out = execFileSync(coinutilsBin, ["compute-root", statePath], { encoding: "utf8" }).trim();
-    return BigInt(out).toString(16).padStart(64, "0");
-  } catch {
-    return "0".repeat(64);
-  }
+  // P1 #10: a zero-root fallback here would silently poison TREE_ROOT_KEY and
+  // mark KnownRoot(0) on-chain, breaking every future withdrawal that builds
+  // on get_root(). A tooling failure must fail the job loudly instead.
+  const out = execFileSync(coinutilsBin, ["compute-root", statePath], { encoding: "utf8" }).trim();
+  return BigInt(out).toString(16).padStart(64, "0");
 }
 
 function coinFromPath(path: string): GeneratedCoin {
@@ -252,18 +251,22 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
       signatures: sigs as import("@shade/mpc-crypto").NodeSignature[]
     };
 
-    // Build committee info list from embedded signatures (each sig carries signingPubkey).
-    // In production these pubkeys are pinned in contract storage via set_committee().
-    const committeeUrl = env.MPC_COMMITTEE_URL ?? "http://localhost:8090";
-    let committee: import("@shade/mpc-crypto").CommitteeNodeInfo[] = [];
+    // P0 #7: pin the committee from the on-chain registry (set via the pool's
+    // admin-only set_committee()), never from the signatures being checked —
+    // deriving the "expected" committee from the batch's own signatures makes
+    // verification tautological (any self-consistent attacker keyset passes).
+    if (!pool || !relayerSecret) throw new Error("MPC_SETTLE_SUBMIT missing SHIELDED_POOL_CONTRACT / STELLAR_RELAYER_SECRET to pin on-chain committee");
+    let committee: import("@shade/mpc-crypto").CommitteeNodeInfo[];
     try {
-      const resp = await fetch(`${committeeUrl}/v1/mpc/committee`);
-      if (resp.ok) {
-        const data = await resp.json() as { nodes: import("@shade/mpc-crypto").CommitteeNodeInfo[] };
-        committee = data.nodes;
-      }
-    } catch {
-      committee = sigs.map(s => ({ nodeId: s.nodeId, encryptionPubkey: "", signingPubkey: s.signingPubkey }));
+      const res = sorobanInvoke({
+        contractId: pool, secret: relayerSecret, method: "get_committee",
+        rpcUrl: RPC, passphrase: PASS, readOnly: true, retries: 3
+      });
+      const onChainPubkeys = JSON.parse(res.returnValue) as string[];
+      if (onChainPubkeys.length === 0) throw new Error("on-chain committee is empty — call pool.set_committee() first");
+      committee = onChainPubkeys.map((pk, i) => ({ nodeId: `chain-${i}`, encryptionPubkey: "", signingPubkey: pk.toLowerCase() }));
+    } catch (err) {
+      throw new Error(`MPC batch ${p.batchId}: failed to pin committee from pool.get_committee(): ${(err as Error).message}`);
     }
 
     const valid = verifySignedBatch(batch, committee);
@@ -348,69 +351,56 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
 
     const missingNote = !nullifierA || !nullifierB || !outCommitA || !outCommitB;
 
-    // Attempt on-chain settlement.
-    const poolContract = String(p.pool ?? env.SHIELDED_POOL_CONTRACT ?? "");
-    if (poolContract && env.STELLAR_RELAYER_SECRET && !missingNote) {
-      try {
-        await queue.setStatus(job.job_id, "submitting", `pool.mpc_settle match[${p.matchIndex}]`);
-
-        // Stellar CLI expects bare hex (no 0x) for BytesN, and JSON arrays for Vec<BytesN>.
-        const stripHex = (h: string) => h.startsWith("0x") ? h.slice(2) : h;
-        const nullA32   = stripHex(nullifierA!);
-        const nullB32   = stripHex(nullifierB!);
-        const cmtA32    = stripHex(outCommitA!);
-        const cmtB32    = stripHex(outCommitB!);
-        const hash32    = stripHex(String(p.batchHash));
-        const newRoot32 = await computeMpcRoot(queue, outCommitA!, outCommitB!);
-
-        // Build committee signature args: JSON arrays of pubkeys + sigs.
-        const pubkeysJson = JSON.stringify(sigs.map(s => stripHex(s.signingPubkey)));
-        const sigsJson    = JSON.stringify(sigs.map(s => stripHex(s.signature)));
-
-        // Pass proof_bytes / pub_signals_bytes as Some(hex) or null (Option<Bytes>).
-        const r = sorobanInvoke({
-          contractId: poolContract, secret: env.STELLAR_RELAYER_SECRET,
-          method: "mpc_settle", rpcUrl: RPC, passphrase: PASS, retries: 3,
-          args: [
-            "--nullifier_a",         nullA32,
-            "--nullifier_b",         nullB32,
-            "--output_commitment_a", cmtA32,
-            "--output_commitment_b", cmtB32,
-            "--new_root",            newRoot32,
-            "--batch_hash",          hash32,
-            "--signer_pubkeys",      pubkeysJson,
-            "--signatures",          sigsJson,
-            "--proof_bytes",         zkProofHex ?? "null",
-            "--pub_signals_bytes",   zkPublicHex ?? "null",
-          ]
-        });
-        return {
-          settled: true, onChain: true,
-          batchId: p.batchId, matchIndex: p.matchIndex,
-          txHash: r.txHash,
-          nullifierA, nullifierB,
-          zkProof: zkProofHex ? { generated: true, verified: zkVerified } : { generated: false },
-          note: zkProofHex
-            ? `pool.mpc_settle confirmed with ZK proof (verified=${zkVerified})`
-            : "pool.mpc_settle confirmed (committee sigs only — compile circuit for ZK proof)"
-        };
-      } catch (err) {
-        // mpc_settle invocation failed — log error, fall through to off-chain result.
-        console.warn(`[relayer] pool.mpc_settle failed: ${(err as Error).message}`);
-      }
+    // P0 #7: mpc_settle must never be reported as settled without an actual
+    // on-chain tx hash — a prior version returned `settled: true, onChain:
+    // false` here, which downstream indexers/accounting could misread as a
+    // completed settlement. Missing note data or a failed on-chain call are
+    // real failures: throw so the job is marked failed, not "ready".
+    if (missingNote) {
+      throw new Error(`MPC batch ${p.batchId} match[${p.matchIndex}]: note data missing from DB — intent not submitted through API`);
     }
 
+    await queue.setStatus(job.job_id, "submitting", `pool.mpc_settle match[${p.matchIndex}]`);
+
+    // Stellar CLI expects bare hex (no 0x) for BytesN, and JSON arrays for Vec<BytesN>.
+    const stripHex = (h: string) => h.startsWith("0x") ? h.slice(2) : h;
+    const nullA32   = stripHex(nullifierA!);
+    const nullB32   = stripHex(nullifierB!);
+    const cmtA32    = stripHex(outCommitA!);
+    const cmtB32    = stripHex(outCommitB!);
+    const hash32    = stripHex(String(p.batchHash));
+    const newRoot32 = await computeMpcRoot(queue, outCommitA!, outCommitB!);
+
+    // Build committee signature args: JSON arrays of pubkeys + sigs.
+    const pubkeysJson = JSON.stringify(sigs.map(s => stripHex(s.signingPubkey)));
+    const sigsJson    = JSON.stringify(sigs.map(s => stripHex(s.signature)));
+
+    // Pass proof_bytes / pub_signals_bytes as Some(hex) or null (Option<Bytes>).
+    const r = sorobanInvoke({
+      contractId: pool, secret: relayerSecret,
+      method: "mpc_settle", rpcUrl: RPC, passphrase: PASS, retries: 3,
+      args: [
+        "--nullifier_a",         nullA32,
+        "--nullifier_b",         nullB32,
+        "--output_commitment_a", cmtA32,
+        "--output_commitment_b", cmtB32,
+        "--new_root",            newRoot32,
+        "--batch_hash",          hash32,
+        "--signer_pubkeys",      pubkeysJson,
+        "--signatures",          sigsJson,
+        "--proof_bytes",         zkProofHex ?? "null",
+        "--pub_signals_bytes",   zkPublicHex ?? "null",
+      ]
+    });
     return {
-      settled: true, onChain: false,
+      settled: true, onChain: true,
       batchId: p.batchId, matchIndex: p.matchIndex,
-      intentAId: p.intentAId, intentBId: p.intentBId,
-      matchedAmount7dp: p.matchedAmount7dp,
-      nullifierA, nullifierB, outCommitA, outCommitB,
-      missingNote,
+      txHash: r.txHash,
+      nullifierA, nullifierB,
       zkProof: zkProofHex ? { generated: true, verified: zkVerified } : { generated: false },
-      note: missingNote
-        ? "note data missing from DB — intent not submitted through API"
-        : "committee sigs verified off-chain; mpc_settle call failed (check relayer logs)"
+      note: zkProofHex
+        ? `pool.mpc_settle confirmed with ZK proof (verified=${zkVerified})`
+        : "pool.mpc_settle confirmed (committee sigs only — compile circuit for ZK proof)"
     };
   }
 
