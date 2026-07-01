@@ -13,8 +13,19 @@ cd .zk-ref/soroban-examples
 git apply /path/to/shade-protocol/vendor-patches/coinutils-and-circuits.patch
 cp /path/to/shade-protocol/vendor-patches/transfer.rs.new \
    privacy-pools/cli/coinutils/src/merkle/transfer.rs
-cargo build --release --bin stellar-coinutils
+# Build the binary WITH testutils: coinutils resets the Soroban host budget via
+# env.cost_estimate() (a testutils API), so the release binary needs the feature.
+cd privacy-pools/cli/coinutils
+cargo build --release --features soroban-sdk/testutils --bin stellar-coinutils
 ```
+
+This build is now verified locally on macOS (Rust 1.89, soroban-sdk 25.1) and in
+CI (`.github/workflows/ci.yml` `circuits` job). The earlier "not locally
+build-verified" caveat is resolved: the patch now also wires the `--association-file`
+flag through the `transfer` subcommand end-to-end (args.rs → main.rs → commands.rs
+→ `TransferManager::build_transfer`), and the build uses the `testutils` feature.
+`npm run circuits:build` reports `private_transfer nPublic=7` and
+`npm run circuits:test` verifies all three circuits' proofs.
 
 ## What the patches add (Shade modifications)
 
@@ -33,25 +44,16 @@ cargo build --release --bin stellar-coinutils
   dummy values are used and the proof only verifies against an on-chain
   `associationRoot` of 0 (compliance disabled) — same convention as withdraw.
 
-**Not locally build-verified**: this machine's Rust toolchain is broken for
-this dependency graph independent of these changes — confirmed two ways: (1)
-the default MSVC host's `link.exe` fails linking `serde`/`proc-macro2`/
-`typenum`'s build scripts on an untouched clone of this same commit; (2)
-explicitly forcing the GNU toolchain (`rustup run stable-x86_64-pc-windows-gnu
-cargo build`) instead fails on a missing `dlltool.exe` compiling `getrandom`.
-Neither is related to this patch. The locally pre-built `stellar-coinutils`
-binary in `.zk-ref/` therefore still reflects the PRE-P2-#14 source (no
-`--association-file` flag) — `npm run circuits:test` will fail on
-`private_transfer` locally until someone rebuilds it on a working toolchain.
-This does **not** affect CI/fresh clones: they build the binary from source
-following the steps above, which already includes this patch, so they get a
-correct, current build. The patch was verified to `git apply` cleanly against
-a fresh clone; the circuit side (`circuits/private_transfer/main.circom`) was
-independently rebuilt and verified here — `circuits:build` reports
-`nPublic=7` as expected and the trusted setup completed. Only the native
-`transfer.rs` change is unverified locally; its `handle_association_set`
-logic is a direct mirror of the proven, already-deployed one in
-`withdrawal.rs` (fetched from upstream to copy exactly).
+**Build-verified**: `stellar-coinutils` builds from this patch + `transfer.rs.new`
+with the `soroban-sdk/testutils` feature on Rust 1.89 / soroban-sdk 25.1. The
+`transfer` subcommand's `--association-file` flag is wired end-to-end and its
+`handle_association_set` logic mirrors the proven `withdrawal.rs` path. With the
+rebuilt binary, `npm run circuits:build` reports `private_transfer nPublic=7`
+(6 public inputs + `nullifierHash`) and `npm run circuits:test` verifies the
+withdraw_public, private_transfer (incl. ASP binding), and deposit_note_mint
+proofs. Note: regenerating the trusted setup produces new verifying keys, so the
+on-chain `private_transfer`/`mpc_settlement` verifier contracts must be
+redeployed from the current vks before the on-chain path matches local proofs.
 
 Shade's own circuits live in-repo under `circuits/withdraw_public/` and
 `circuits/private_transfer/` (the `.circom` sources). Only the upstream

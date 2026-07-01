@@ -106,15 +106,22 @@ jobs:
           chmod +x /usr/local/bin/circom
       - run: npm ci
       - name: Provision ZK reference (coinutils + ptau)
+        # Reproduce the prover per vendor-patches/README.md: clone upstream
+        # soroban-examples, apply the Shade coinutils/circuit patch, drop in the
+        # transfer subcommand, and build stellar-coinutils WITH the testutils
+        # feature (coinutils resets the host budget via cost_estimate()).
         run: |
-          if [ -n "${SHADE_ZK_REF_URL}" ]; then
-            git clone "${SHADE_ZK_REF_URL}" .zk-ref/soroban-examples
-            (cd .zk-ref/soroban-examples/privacy-pools && cargo build --release -p stellar-coinutils || cargo build --release)
-          else
+          if [ -z "${SHADE_ZK_REF_URL}" ]; then
             echo "SHADE_ZK_REF_URL not set; cannot run circuit proof tests reproducibly." >&2
             echo "Set the SHADE_ZK_REF_URL repo variable to the soroban-examples fork." >&2
             exit 1
           fi
+          git clone "${SHADE_ZK_REF_URL}" .zk-ref/soroban-examples
+          git -C .zk-ref/soroban-examples apply "$GITHUB_WORKSPACE/vendor-patches/coinutils-and-circuits.patch"
+          cp vendor-patches/transfer.rs.new \
+            .zk-ref/soroban-examples/privacy-pools/cli/coinutils/src/merkle/transfer.rs
+          (cd .zk-ref/soroban-examples/privacy-pools/cli/coinutils \
+            && cargo build --release --features soroban-sdk/testutils --bin stellar-coinutils)
         env:
           SHADE_ZK_REF_URL: ${{ vars.SHADE_ZK_REF_URL }}
       - name: Build circuits
