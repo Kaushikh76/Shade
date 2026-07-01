@@ -1,4 +1,6 @@
 import { shamirSplit, shamirReconstruct, encodeShare, decodeShare } from "./shamir.js";
+import { computeBatchHash } from "./committee.js";
+import type { MatchResult } from "./types.js";
 
 // mpc-crypto unit tests. Phase 1 B5 expands this with batch-hash total-order and
 // coordinator matching tests; this file starts with the Shamir sharing core.
@@ -58,6 +60,34 @@ function check(name: string, ok: boolean, detail = ""): void {
   threw = false;
   try { shamirSplit(1n, 4, 3); } catch { threw = true; }
   check("shamir: threshold > total rejected", threw);
+}
+
+// --- B5.2: computeBatchHash total-order determinism (spec §5.3.2) ---
+{
+  const m1: MatchResult = { intentAId: "a1", intentBId: "b1", matchedAmount7dp: "1000000", inputAsset: "USDC", outputAsset: "XLM" };
+  const m2: MatchResult = { intentAId: "a2", intentBId: "b2", matchedAmount7dp: "2000000", inputAsset: "USDC", outputAsset: "XLM" };
+  const m3: MatchResult = { intentAId: "a3", intentBId: "b3", matchedAmount7dp: "3000000", inputAsset: "XLM", outputAsset: "USDC" };
+
+  const h1 = computeBatchHash("batch-1", [m1, m2, m3]);
+  const hReordered = computeBatchHash("batch-1", [m3, m1, m2]);
+  check("batchHash: same logical batch in different input order -> same hash", h1 === hReordered);
+
+  // Changing any signed field changes the hash.
+  const hAmt = computeBatchHash("batch-1", [{ ...m1, matchedAmount7dp: "1000001" }, m2, m3]);
+  check("batchHash: changing matchedAmount changes hash", hAmt !== h1);
+  const hAsset = computeBatchHash("batch-1", [{ ...m1, outputAsset: "EURC" }, m2, m3]);
+  check("batchHash: changing outputAsset changes hash", hAsset !== h1);
+  const hIntent = computeBatchHash("batch-1", [{ ...m1, intentAId: "a9" }, m2, m3]);
+  check("batchHash: changing intentAId changes hash", hIntent !== h1);
+  const hBatchId = computeBatchHash("batch-2", [m1, m2, m3]);
+  check("batchHash: changing batchId changes hash", hBatchId !== h1);
+
+  // Two matches sharing (a,b) but differing in amount must not collide on sort.
+  const c1: MatchResult = { intentAId: "x", intentBId: "y", matchedAmount7dp: "1", inputAsset: "USDC", outputAsset: "XLM" };
+  const c2: MatchResult = { intentAId: "x", intentBId: "y", matchedAmount7dp: "2", inputAsset: "USDC", outputAsset: "XLM" };
+  const hc = computeBatchHash("b", [c1, c2]);
+  const hcRev = computeBatchHash("b", [c2, c1]);
+  check("batchHash: full-content total order is stable for (a,b) ties", hc === hcRev);
 }
 
 if (failed > 0) {

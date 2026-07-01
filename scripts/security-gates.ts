@@ -93,6 +93,23 @@ const gates: Gate[] = [
     name: "UI does not show raw CCTP_INBOUND_AFTER_USER_BURN as primary text",
     // allowed in non-display contexts; forbid it appearing in JSX text of web pages.
     cmd: `grep -rn 'CCTP_INBOUND_AFTER_USER_BURN' apps/web/src/app 2>/dev/null || true`
+  },
+  // Phase 1 B1/B2 fail-closed gates (spec §5.1, §5.2).
+  {
+    // FORBID the fail-open pattern: mpc_settle must not gate proof verification
+    // on `if let Some(mpc_verifier)`, which skips verification when unset.
+    name: "mpc_settle proof mandatory: no if-let-Some(mpc_verifier) fail-open (B1)",
+    cmd: `grep -n "if let Some(mpc_verifier)" contracts/stellar/shielded_pool/src/lib.rs || true`
+  },
+  {
+    // REQUIRE the relayer to refuse a proofless mpc_settle submission.
+    name: "relayer refuses proofless mpc_settle (B1)",
+    cmd: `grep -q "refusing to submit proofless mpc_settle" apps/relayer/src/worker.ts && echo "" || echo RELAYER_PROOFLESS_MISSING`
+  },
+  {
+    // REQUIRE mpc_settle to bind the canonical association root and the deadline.
+    name: "mpc_settle binds canonical association root + deadline (B2)",
+    cmd: `( grep -q "canonical_assoc" contracts/stellar/shielded_pool/src/lib.rs && grep -q "deadline_ledger" contracts/stellar/shielded_pool/src/lib.rs ) && echo "" || echo MPC_B2_BINDING_MISSING`
   }
 ];
 

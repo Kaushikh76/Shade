@@ -42,10 +42,14 @@ export function matchIntents(
     while (ai < sorted.length && bi < reverseSorted.length) {
       const a = sorted[ai];
       const b = reverseSorted[bi];
-      // Only advance the side that's actually already used — advancing both
-      // unconditionally can skip a still-unused, otherwise-valid counterparty.
+      // B5.3 (spec §5.3.3): only advance the side that's actually already used —
+      // advancing both unconditionally can skip a still-unused, otherwise-valid
+      // counterparty. Also skip a self-pairing: for a same-asset group the
+      // reverse group IS this group, so a[ai] and b[bi] can be the SAME intent;
+      // matching an intent with itself must never happen — advance b to the next
+      // candidate instead of consuming a against itself.
       if (used.has(a.intentId)) { ai++; continue; }
-      if (used.has(b.intentId)) { bi++; continue; }
+      if (used.has(b.intentId) || a.intentId === b.intentId) { bi++; continue; }
 
       const matchAmt = a.amount7dp < b.amount7dp ? a.amount7dp : b.amount7dp;
       matches.push({

@@ -360,6 +360,21 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
       throw new Error(`MPC batch ${p.batchId} match[${p.matchIndex}]: note data missing from DB — intent not submitted through API`);
     }
 
+    // B1 (spec §5.1): refuse to submit a proofless mpc_settle. If ZK proof
+    // generation failed or the circuit artifacts are missing, fail the job
+    // instead of submitting `proof_bytes = null` — the on-chain settle now
+    // rejects proofless calls anyway (mandatory verifier), so this both avoids a
+    // wasted failed tx and keeps the failure explicit. The only escape is an
+    // explicit dev-only flag that MUST default false and is never set in E2E
+    // acceptance.
+    const unsafeProofless = process.env.ENABLE_UNSAFE_PROOFLESS_MPC_SETTLE === "true";
+    if ((!zkProofHex || !zkPublicHex) && !unsafeProofless) {
+      throw new Error(
+        "mpc_settlement proof generation failed or circuit artifacts missing; refusing to submit proofless mpc_settle " +
+        "(build circuits/mpc_settlement and supply coin/assoc witness paths; ENABLE_UNSAFE_PROOFLESS_MPC_SETTLE is dev-only and must never be used in E2E acceptance)"
+      );
+    }
+
     await queue.setStatus(job.job_id, "submitting", `pool.mpc_settle match[${p.matchIndex}]`);
 
     // Stellar CLI expects bare hex (no 0x) for BytesN, and JSON arrays for Vec<BytesN>.
@@ -400,7 +415,7 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
       zkProof: zkProofHex ? { generated: true, verified: zkVerified } : { generated: false },
       note: zkProofHex
         ? `pool.mpc_settle confirmed with ZK proof (verified=${zkVerified})`
-        : "pool.mpc_settle confirmed (committee sigs only — compile circuit for ZK proof)"
+        : "pool.mpc_settle submitted WITHOUT proof (ENABLE_UNSAFE_PROOFLESS_MPC_SETTLE dev-only; on-chain settle will reject this)"
     };
   }
 

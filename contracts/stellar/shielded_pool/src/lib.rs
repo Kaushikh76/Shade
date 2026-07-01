@@ -695,9 +695,10 @@ impl ShieldedPool {
     ///
     /// Verification steps:
     ///   1. Require ≥ ceil(2n/3) valid ed25519 signatures from registered committee nodes.
-    ///   2. If mpc_verifier is set (Phase C): verify the Groth16 mpc_settlement proof
-    ///      and check its public signals match nullifier_a/b, output_commitment_a/b,
-    ///      batch_hash, poolId, and chainId. Proof is mandatory once the verifier is set.
+    ///   2. Verify the Groth16 mpc_settlement proof (MANDATORY once a committee
+    ///      exists — B1) and check its public signals match nullifier_a/b,
+    ///      output_commitment_a/b, batch_hash, poolId, chainId, the canonical
+    ///      associationRoot, and a non-expired deadlineLedger (B2).
     ///   3. Spend nullifier_a and nullifier_b (prevents double-settle / double-withdraw).
     ///   4. Record the new Merkle root (which now includes output_commitment_a + output_commitment_b).
     ///   5. Emit a settlement event so off-chain indexers can credit the output notes.
@@ -784,55 +785,77 @@ impl ShieldedPool {
         //   [6] batchHash (= hashToField(batch_hash))
         //   [7] poolId            [8] chainId
         //   [9] matchedAmount7dp  [10] deadlineLedger
-        if let Some(mpc_verifier) = env.storage().instance().get::<Symbol, Address>(&MPC_VERIFIER) {
-            let pb = proof_bytes.unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
-            let sb = pub_signals_bytes.unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
+        // B1 (spec §5.1): once a committee exists (enforced above), the MPC
+        // settlement proof is MANDATORY. The verifier must be configured, both the
+        // proof and its public signals must be present, and verification must
+        // return true. There is NO fail-open path: an unset verifier or a missing
+        // proof aborts the settlement (fail closed).
+        let mpc_verifier: Address = env.storage().instance()
+            .get::<Symbol, Address>(&MPC_VERIFIER)
+            .unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
+        let pb = proof_bytes.unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
+        let sb = pub_signals_bytes.unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
 
-            let ok: bool = env.invoke_contract(
-                &mpc_verifier,
-                &Symbol::new(&env, "verify"),
-                vec![&env, pb.to_val(), sb.to_val()],
-            );
-            if !ok {
-                panic_err(&env, Error::MpcProofInvalid);
-            }
+        let ok: bool = env.invoke_contract(
+            &mpc_verifier,
+            &Symbol::new(&env, "verify"),
+            vec![&env, pb.to_val(), sb.to_val()],
+        );
+        if !ok {
+            panic_err(&env, Error::MpcProofInvalid);
+        }
 
-            // Bind proof public signals to the provided call arguments.
-            let signals = parse_public_signals(&env, &sb);
-            // [0] nullifierHashA must equal nullifier_a
-            if signals.get(0).unwrap() != nullifier_a {
-                panic_err(&env, Error::MpcSignalMismatch);
-            }
-            // [1] nullifierHashB must equal nullifier_b
-            if signals.get(1).unwrap() != nullifier_b {
-                panic_err(&env, Error::MpcSignalMismatch);
-            }
-            // [2] outputCommitmentA must equal output_commitment_a
-            if signals.get(2).unwrap() != output_commitment_a {
-                panic_err(&env, Error::MpcSignalMismatch);
-            }
-            // [3] outputCommitmentB must equal output_commitment_b
-            if signals.get(3).unwrap() != output_commitment_b {
-                panic_err(&env, Error::MpcSignalMismatch);
-            }
-            // [4] stateRoot must be a known root (input notes were in this tree)
-            let state_root: BytesN<32> = signals.get(4).unwrap();
-            if !env.storage().persistent().get(&DataKey::KnownRoot(state_root)).unwrap_or(false) {
-                panic_err(&env, Error::UnknownRoot);
-            }
-            // [6] batchHash field element must match hashToField(batch_hash)
-            let batch_hash_field = Self::hash_to_field(&env, &batch_hash);
-            if signals.get(6).unwrap() != batch_hash_field {
-                panic_err(&env, Error::MpcSignalMismatch);
-            }
-            // [7][8] poolId and chainId match this contract's domain separators
-            let pool_id: u32 = env.storage().instance().get(&POOLID).unwrap();
-            let chain_id: u32 = env.storage().instance().get(&CHAINID).unwrap();
-            let pool_in: i128 = fr32_to_i128(&signals.get(7).unwrap());
-            let chain_in: i128 = fr32_to_i128(&signals.get(8).unwrap());
-            if pool_in != pool_id as i128 || chain_in != chain_id as i128 {
-                panic_err(&env, Error::WrongDomain);
-            }
+        // Bind proof public signals to the provided call arguments.
+        let signals = parse_public_signals(&env, &sb);
+        // [0] nullifierHashA must equal nullifier_a
+        if signals.get(0).unwrap() != nullifier_a {
+            panic_err(&env, Error::MpcSignalMismatch);
+        }
+        // [1] nullifierHashB must equal nullifier_b
+        if signals.get(1).unwrap() != nullifier_b {
+            panic_err(&env, Error::MpcSignalMismatch);
+        }
+        // [2] outputCommitmentA must equal output_commitment_a
+        if signals.get(2).unwrap() != output_commitment_a {
+            panic_err(&env, Error::MpcSignalMismatch);
+        }
+        // [3] outputCommitmentB must equal output_commitment_b
+        if signals.get(3).unwrap() != output_commitment_b {
+            panic_err(&env, Error::MpcSignalMismatch);
+        }
+        // [4] stateRoot must be a known root (input notes were in this tree)
+        let state_root: BytesN<32> = signals.get(4).unwrap();
+        if !env.storage().persistent().get(&DataKey::KnownRoot(state_root)).unwrap_or(false) {
+            panic_err(&env, Error::UnknownRoot);
+        }
+        // [5] associationRoot must equal the canonical ASP root (B2, spec §5.2).
+        // The prover must not choose its own compliance root. A pool with no
+        // configured ASP root cannot MPC-settle (fail closed).
+        let assoc_root: BytesN<32> = signals.get(5).unwrap();
+        let canonical_assoc: BytesN<32> = env.storage().instance()
+            .get(&ASSOCROOT)
+            .unwrap_or_else(|| panic_err(&env, Error::WrongAssociation));
+        if assoc_root != canonical_assoc {
+            panic_err(&env, Error::WrongAssociation);
+        }
+        // [6] batchHash field element must match hashToField(batch_hash)
+        let batch_hash_field = Self::hash_to_field(&env, &batch_hash);
+        if signals.get(6).unwrap() != batch_hash_field {
+            panic_err(&env, Error::MpcSignalMismatch);
+        }
+        // [7][8] poolId and chainId match this contract's domain separators
+        let pool_id: u32 = env.storage().instance().get(&POOLID).unwrap();
+        let chain_id: u32 = env.storage().instance().get(&CHAINID).unwrap();
+        let pool_in: i128 = fr32_to_i128(&signals.get(7).unwrap());
+        let chain_in: i128 = fr32_to_i128(&signals.get(8).unwrap());
+        if pool_in != pool_id as i128 || chain_in != chain_id as i128 {
+            panic_err(&env, Error::WrongDomain);
+        }
+        // [10] deadlineLedger must not be in the past (B2, spec §5.2): stale
+        // matches must not execute.
+        let deadline_ledger: i128 = fr32_to_i128(&signals.get(10).unwrap());
+        if (env.ledger().sequence() as i128) > deadline_ledger {
+            panic_err(&env, Error::Expired);
         }
 
         // Spend both nullifiers atomically.  NullifierRegistry.spend panics if already used.
