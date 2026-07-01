@@ -70,7 +70,7 @@ pub struct UpgradeProposal {
     pub contract_id: Address,
     pub new_wasm_hash: BytesN<32>,
     pub approvals: Vec<Address>,
-    pub quorum_at_ledger: u32, // 0 until threshold reached; timelock counts from here
+    pub quorum_at_ledger: Option<u32>, // None until threshold reached; timelock counts from the recorded ledger
     pub executed: bool,
     pub cancelled: bool,
 }
@@ -183,7 +183,7 @@ impl GovernanceGuardian {
         let proposal = UpgradeProposal {
             contract_id, new_wasm_hash,
             approvals: Vec::from_array(&env, [guardian]),
-            quorum_at_ledger: 0, executed: false, cancelled: false,
+            quorum_at_ledger: None, executed: false, cancelled: false,
         };
         env.storage().persistent().set(&DataKey::UpgradeProposal(id), &proposal);
         Self::check_upgrade_quorum(&env, id, proposal);
@@ -204,8 +204,8 @@ impl GovernanceGuardian {
 
     fn check_upgrade_quorum(env: &Env, id: u32, mut proposal: UpgradeProposal) {
         let threshold: u32 = env.storage().instance().get(&THRESHOLD).unwrap_or(1);
-        if proposal.quorum_at_ledger == 0 && proposal.approvals.len() >= threshold {
-            proposal.quorum_at_ledger = env.ledger().sequence();
+        if proposal.quorum_at_ledger.is_none() && proposal.approvals.len() >= threshold {
+            proposal.quorum_at_ledger = Some(env.ledger().sequence());
             env.storage().persistent().set(&DataKey::UpgradeProposal(id), &proposal);
             env.events().publish((symbol_short!("upquorum"), id), proposal.contract_id.clone());
         }
@@ -232,9 +232,10 @@ impl GovernanceGuardian {
         let proposal: UpgradeProposal = env.storage().persistent().get(&DataKey::UpgradeProposal(proposal_id))
             .unwrap_or_else(|| panic_err(&env, Error::ProposalNotFound));
         if proposal.executed || proposal.cancelled { panic_err(&env, Error::AlreadyExecuted); }
-        if proposal.quorum_at_ledger == 0 { panic_err(&env, Error::ThresholdNotMet); }
+        let quorum_ledger: u32 = proposal.quorum_at_ledger
+            .unwrap_or_else(|| panic_err(&env, Error::ThresholdNotMet));
         let delay: u32 = env.storage().instance().get(&UPGRADE_DELAY).unwrap_or(0);
-        if env.ledger().sequence() < proposal.quorum_at_ledger + delay { panic_err(&env, Error::TimelockNotElapsed); }
+        if env.ledger().sequence() < quorum_ledger + delay { panic_err(&env, Error::TimelockNotElapsed); }
 
         let _: () = env.invoke_contract(
             &proposal.contract_id,

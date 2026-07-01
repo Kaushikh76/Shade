@@ -10,6 +10,11 @@ members = [
   "proof_verifiers",
   "shielded_pool"
 ]
+# lean_imt tracks soroban-sdk 25 as a standalone crate; keep it out of this
+# soroban-sdk 23 workspace so it can be built/tested on its own.
+exclude = [
+  "lean_imt"
+]
 
 [workspace.dependencies]
 soroban-sdk = "23.0.3"

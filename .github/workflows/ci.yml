@@ -1,59 +1,142 @@
 name: CI
 
+# Spec §4.4. Every PR runs: typecheck, Rust contract tests, circuit witness tests,
+# backend unit/integration tests, secret scanning, and security regression tests.
+# Nightly runs the testnet E2E functional + adversarial suites.
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
+  schedule:
+    # Nightly 03:00 UTC — testnet E2E (functional + adversarial).
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  NODE_VERSION: "22"
+
 jobs:
-  # ── TypeScript: typecheck + offline unit tests ─────────────────────────────
+  # ── TypeScript: typecheck + backend unit/integration tests ─────────────────
   typecheck-and-test:
     name: TypeScript
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: ${{ env.NODE_VERSION }}
           cache: npm
-
-      - name: Install dependencies
-        run: npm ci
-
+      - run: npm ci
       - name: Typecheck
         run: npm run typecheck
+      - name: Backend unit/integration tests
+        run: npm run test:ts
 
-      - name: Note vault unit tests
-        run: npm run vault:test
+  # ── Security regression tests + static forbidden-pattern gates ─────────────
+  security:
+    name: Security gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Security regression + gates
+        run: npm run test:security
 
-      - name: SDK smoke tests
-        run: npm run sdk:test
+  # ── Secret scanning ─────────────────────────────────────────────────────────
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Security gates
-        run: npm run security:gates
-
-  # ── Rust: Soroban contract build ───────────────────────────────────────────
-  contracts-build:
+  # ── Rust: Soroban contract build + tests ───────────────────────────────────
+  contracts:
     name: Stellar contracts
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
       - name: Install Rust stable + wasm32v1-none
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32v1-none
-
       - name: Cache Cargo
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: contracts/stellar
-
+      - run: npm ci
       - name: Build Soroban contracts
         run: cargo build --manifest-path contracts/stellar/Cargo.toml --target wasm32v1-none --release
+      - name: Contract tests (workspace + lean_imt)
+        run: npm run test:contracts
+
+  # ── Circom: witness/proof tests ────────────────────────────────────────────
+  circuits:
+    name: Circuits
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install circom
+        run: |
+          curl -L https://github.com/iden3/circom/releases/latest/download/circom-linux-amd64 -o /usr/local/bin/circom
+          chmod +x /usr/local/bin/circom
+      - run: npm ci
+      - name: Provision ZK reference (coinutils + ptau)
+        run: |
+          if [ -n "${SHADE_ZK_REF_URL}" ]; then
+            git clone "${SHADE_ZK_REF_URL}" .zk-ref/soroban-examples
+            (cd .zk-ref/soroban-examples/privacy-pools && cargo build --release -p stellar-coinutils || cargo build --release)
+          else
+            echo "SHADE_ZK_REF_URL not set; cannot run circuit proof tests reproducibly." >&2
+            echo "Set the SHADE_ZK_REF_URL repo variable to the soroban-examples fork." >&2
+            exit 1
+          fi
+        env:
+          SHADE_ZK_REF_URL: ${{ vars.SHADE_ZK_REF_URL }}
+      - name: Build circuits
+        run: npm run circuits:build
+      - name: Circuit witness/proof tests
+        run: npm run test:circuits
+
+  # ── Nightly: testnet E2E (functional + adversarial) ────────────────────────
+  nightly-testnet:
+    name: Testnet E2E (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: testnet E2E acceptance (functional + adversarial)
+        run: npm run e2e:testnet:all
+        env:
+          SHADE_TESTNET_READY: "true"
+          STELLAR_RPC_URL: ${{ secrets.STELLAR_RPC_URL }}
+          SHIELDED_POOL_CONTRACT_ID: ${{ secrets.SHIELDED_POOL_CONTRACT_ID }}
