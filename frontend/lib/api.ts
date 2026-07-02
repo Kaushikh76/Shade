@@ -68,6 +68,7 @@ export type Contracts = {
   verifierDepositNoteMint: string
   cctpForwarder: string
   usdcSac: string
+  xlmSac: string
 }
 export type HealthFull = { ok: boolean; db: boolean; pool: string | null; network: string }
 export type SyncWalletInput = { wallet_type: "EVM" | "STELLAR"; wallet_source?: string; chain: string; address: string; privy_wallet_id?: string }
