@@ -753,6 +753,70 @@ fn mpc_settle_accepts_valid_proof() {
     assert!(result.is_ok(), "valid proof + correct signals must settle: {:?}", result);
 }
 
+/// §9.6: fewer than threshold signatures (1 of 2/3) must be rejected.
+#[test]
+fn mpc_settle_rejects_threshold_minus_one() {
+    let p = setup_proof(true);
+    let env = &p.h.env;
+    let signals = valid_signals(env, &p.nullifier_a, &p.nullifier_b, &p.out_a, &p.out_b, &p.assoc, &p.batch_arr, 999_999);
+    let one_pk = Vec::from_array(env, [p.signer_pubkeys.get(0).unwrap()]);
+    let one_sig = Vec::from_array(env, [p.signatures.get(0).unwrap()]);
+    let result = p.h.pool.try_mpc_settle(
+        &p.nullifier_a, &p.nullifier_b, &p.out_a, &p.out_b, &p.new_root, &p.batch_hash,
+        &one_pk, &one_sig, &Some(p.proof.clone()), &Some(signals),
+    );
+    assert!(result.is_err(), "below-threshold committee signatures must be rejected");
+}
+
+/// §9.6: a signer pubkey not in the registered committee must be rejected.
+#[test]
+fn mpc_settle_rejects_unknown_signer() {
+    let p = setup_proof(true);
+    let env = &p.h.env;
+    let signals = valid_signals(env, &p.nullifier_a, &p.nullifier_b, &p.out_a, &p.out_b, &p.assoc, &p.batch_arr, 999_999);
+    let rogue = keypair(50); // not in committee {1,2,3}
+    let rogue_pk = pk_bytes(env, &rogue);
+    let rogue_sig = sign_hash(env, &rogue, &p.batch_hash);
+    let pks = Vec::from_array(env, [p.signer_pubkeys.get(0).unwrap(), rogue_pk]);
+    let sigs = Vec::from_array(env, [p.signatures.get(0).unwrap(), rogue_sig]);
+    let result = p.h.pool.try_mpc_settle(
+        &p.nullifier_a, &p.nullifier_b, &p.out_a, &p.out_b, &p.new_root, &p.batch_hash,
+        &pks, &sigs, &Some(p.proof.clone()), &Some(signals),
+    );
+    assert!(result.is_err(), "an unregistered committee signer must be rejected");
+}
+
+/// §9.6: the proof's batchHash signal must match the batch_hash argument.
+#[test]
+fn mpc_settle_rejects_wrong_batch_hash() {
+    let p = setup_proof(true);
+    let env = &p.h.env;
+    // Signals bind a DIFFERENT batch ([8;32]); committee sigs + arg are over [7;32].
+    let other_batch = [8u8; 32];
+    let signals = valid_signals(env, &p.nullifier_a, &p.nullifier_b, &p.out_a, &p.out_b, &p.assoc, &other_batch, 999_999);
+    let result = p.h.pool.try_mpc_settle(
+        &p.nullifier_a, &p.nullifier_b, &p.out_a, &p.out_b, &p.new_root, &p.batch_hash,
+        &p.signer_pubkeys, &p.signatures, &Some(p.proof.clone()), &Some(signals),
+    );
+    assert!(result.is_err(), "a proof bound to a different batch hash must be rejected");
+}
+
+/// §9.6: committee signatures over a different batch must not settle this batch.
+#[test]
+fn mpc_settle_rejects_signature_for_different_batch() {
+    let p = setup_proof(true);
+    let env = &p.h.env;
+    // Sigs (from setup) are over [7;32]; submit batch_hash [8;32] with matching signals.
+    let other_batch = [8u8; 32];
+    let other_hash = BytesN::from_array(env, &other_batch);
+    let signals = valid_signals(env, &p.nullifier_a, &p.nullifier_b, &p.out_a, &p.out_b, &p.assoc, &other_batch, 999_999);
+    let result = p.h.pool.try_mpc_settle(
+        &p.nullifier_a, &p.nullifier_b, &p.out_a, &p.out_b, &p.new_root, &other_hash,
+        &p.signer_pubkeys, &p.signatures, &Some(p.proof.clone()), &Some(signals),
+    );
+    assert!(result.is_err(), "committee signatures over a different batch must be rejected");
+}
+
 /// B1: a proof the verifier rejects must abort settlement.
 #[test]
 fn mpc_settle_rejects_invalid_proof() {

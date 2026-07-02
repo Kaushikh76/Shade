@@ -144,6 +144,13 @@ export function buildMpcSettlementWitness(p: MpcSettlementParams): {
   const wA = JSON.parse(readFileSync(inputPathA, "utf8")) as Record<string, unknown>;
   const wB = JSON.parse(readFileSync(inputPathB, "utf8")) as Record<string, unknown>;
 
+  // Phase 2/5: same-asset crossing — both input notes must be the same asset, and
+  // the output notes inherit it (assetA == assetB == outputAssetA == outputAssetB).
+  const assetId = p.coinA.assetIdField;
+  if (!assetId || assetId !== p.coinB.assetIdField) {
+    throw new Error("mpc_settlement is same-asset only: coinA and coinB must share one assetId");
+  }
+
   const preA = readCoinPreimage(p.coinA);
   const preB = readCoinPreimage(p.coinB);
 
@@ -174,6 +181,7 @@ export function buildMpcSettlementWitness(p: MpcSettlementParams): {
     chainId:          p.chainId,
     matchedAmount7dp: p.matchedAmount7dp,
     deadlineLedger:   p.deadlineLedger,
+    assetId,
 
     // Input note A
     labelA:          preA.label,

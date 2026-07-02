@@ -56,6 +56,9 @@ template MpcSettlement(treeDepth, associationDepth) {
     signal input chainId;
     signal input matchedAmount7dp;
     signal input deadlineLedger;
+    // Phase 2/5: single asset id for a SAME-ASSET crossing — bound into all four
+    // note commitments (assetA == assetB == outputAssetA == outputAssetB, §6.4).
+    signal input assetId;
 
     // ── PRIVATE INPUTS — NOTE A (the note being spent by party A) ───────────
     signal input labelA;
@@ -97,6 +100,7 @@ template MpcSettlement(treeDepth, associationDepth) {
 
     // ── 1. Compute input commitments ─────────────────────────────────────────
     component cmtA = CommitmentHasher();
+    cmtA.assetId   <== assetId;
     cmtA.label     <== labelA;
     cmtA.value     <== valueA;
     cmtA.secret    <== secretA;
@@ -105,6 +109,7 @@ template MpcSettlement(treeDepth, associationDepth) {
     signal _inNhA        <== cmtA.nullifierHash; // unused output consumed
 
     component cmtB = CommitmentHasher();
+    cmtB.assetId   <== assetId;
     cmtB.label     <== labelB;
     cmtB.value     <== valueB;
     cmtB.secret    <== secretB;
@@ -153,6 +158,7 @@ template MpcSettlement(treeDepth, associationDepth) {
 
     // ── 5. Output commitments ────────────────────────────────────────────────
     component outCmtA = CommitmentHasher();
+    outCmtA.assetId   <== assetId;
     outCmtA.label     <== outLabelA;
     outCmtA.value     <== outValueA;
     outCmtA.secret    <== outSecretA;
@@ -161,6 +167,7 @@ template MpcSettlement(treeDepth, associationDepth) {
     signal _outNhA    <== outCmtA.nullifierHash;
 
     component outCmtB = CommitmentHasher();
+    outCmtB.assetId   <== assetId;
     outCmtB.label     <== outLabelB;
     outCmtB.value     <== outValueB;
     outCmtB.secret    <== outSecretB;
@@ -195,5 +202,5 @@ template MpcSettlement(treeDepth, associationDepth) {
 
 component main {public [
     stateRoot, associationRoot, batchHash,
-    poolId, chainId, matchedAmount7dp, deadlineLedger
+    poolId, chainId, matchedAmount7dp, deadlineLedger, assetId
 ]} = MpcSettlement(12, 2);
