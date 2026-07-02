@@ -99,6 +99,8 @@ pub enum Error {
     WrongPrice = 33,        // Phase 3: quoted output != floor(input * priceScaled / PRICE_SCALE)
     UnsupportedDomain = 34, // Phase 4: outbound CCTP destination domain is not supported
     NotCrossAsset = 35,     // Phase 6: priced settlement input assets are equal (not a cross-asset)
+    SupplyUnderflow = 36,   // Phase 7: a note-supply debit would drive per-asset supply negative
+    ReserveBroken = 37,     // Phase 7: note_supply(asset) would exceed vault_balance(asset)
 }
 
 const ADMIN: Symbol = symbol_short!("admin");
@@ -521,11 +523,23 @@ impl ShieldedPool {
     /// Internal: adjust a registered asset's note supply by `delta` (may be
     /// negative). Requires the asset to be registered (fails closed otherwise).
     fn adjust_note_supply(env: &Env, asset_id: &BytesN<32>, delta: i128) {
-        if env.storage().persistent().get::<DataKey, Address>(&DataKey::AssetToken(asset_id.clone())).is_none() {
-            panic_err(env, Error::UnknownAsset);
-        }
+        let token: Address = env.storage().persistent()
+            .get::<DataKey, Address>(&DataKey::AssetToken(asset_id.clone()))
+            .unwrap_or_else(|| panic_err(env, Error::UnknownAsset));
         let cur: i128 = env.storage().persistent().get(&DataKey::NoteSupply(asset_id.clone())).unwrap_or(0i128);
-        env.storage().persistent().set(&DataKey::NoteSupply(asset_id.clone()), &(cur + delta));
+        let next = cur + delta;
+        // Fail closed (spec §6.6): supply can never go negative — that would mean
+        // more notes were spent than exist, i.e. a double-spend / accounting bug.
+        if next < 0 {
+            panic_err(env, Error::SupplyUnderflow);
+        }
+        // Per-asset reserve invariant: the shielded note supply must never exceed
+        // the tokens the pool actually custodies for this asset.
+        let bal = token::TokenClient::new(env, &token).balance(&env.current_contract_address());
+        if next > bal {
+            panic_err(env, Error::ReserveBroken);
+        }
+        env.storage().persistent().set(&DataKey::NoteSupply(asset_id.clone()), &next);
     }
 
     /// Proof-bound CCTP outbound (Stellar -> Arbitrum Sepolia).
@@ -563,12 +577,22 @@ impl ShieldedPool {
         let amount: i128 = fr32_to_i128(&signals.get(2).unwrap()); // P1.5 layout: value@2
         let deadline_ledger: i128 = fr32_to_i128(&signals.get(5).unwrap());
         let state_root: BytesN<32> = signals.get(6).unwrap();      // P1.5 layout: stateRoot@6
+        let asset_id: BytesN<32> = signals.get(17).unwrap();       // Phase 2/4: note asset
         if amount <= 0 {
             panic_err(&env, Error::BadAmount);
         }
         // P1.7 enforce operation type is WITHDRAW_CCTP.
         if op_type != OP_WITHDRAW_CCTP {
             panic_err(&env, Error::WrongOperation);
+        }
+        // Phase 4 asset binding (spec §8.6): CCTP exit is USDC-only. The note's
+        // asset id (bound in the commitment) MUST be the registered USDC asset —
+        // a non-USDC note can never be burned out via CCTP. USDC's asset id is
+        // hash_to_field(sha256(usdc strkey)) == recipient_hash(usdc), matching the
+        // @shade/assets derivation and the deposit proof's assetIdHash.
+        let usdc_addr: Address = env.storage().instance().get(&USDC).unwrap();
+        if asset_id != Self::recipient_hash(&env, &usdc_addr) {
+            panic_err(&env, Error::UnknownAsset);
         }
         // P1.7 deadline must not be expired.
         if (env.ledger().sequence() as i128) > deadline_ledger {
@@ -639,6 +663,9 @@ impl ShieldedPool {
             min_finality_threshold.into_val(&env),
         ];
         env.invoke_contract::<()>(&tmm, &Symbol::new(&env, "deposit_for_burn"), args);
+
+        // Phase 2 (spec §6.6): the burned note leaves the shielded set.
+        Self::adjust_note_supply(&env, &asset_id, -amount);
 
         env.events().publish(
             (symbol_short!("cctpout"), destination_domain),

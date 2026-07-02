@@ -133,6 +133,16 @@ const gates: Gate[] = [
     // rejects a same-asset "priced" settlement.
     name: "mpc_settle_priced is fail-closed cross-asset (Phase 6)",
     cmd: `( grep -q "fn mpc_settle_priced" contracts/stellar/shielded_pool/src/lib.rs && grep -q "MPC_PVERIFIER" contracts/stellar/shielded_pool/src/lib.rs && grep -q "Error::NotCrossAsset" contracts/stellar/shielded_pool/src/lib.rs ) && echo "" || echo MPC_PRICED_MISSING`
+  },
+  {
+    // Phase 7: withdraw_cctp is USDC-only — the note asset must equal registered USDC.
+    name: "withdraw_cctp asserts USDC asset id (Phase 7)",
+    cmd: `grep -q "recipient_hash(&env, &usdc_addr)" contracts/stellar/shielded_pool/src/lib.rs && echo "" || echo CCTP_ASSET_ASSERT_MISSING`
+  },
+  {
+    // Phase 7: per-asset supply must fail closed (no negative supply, supply <= balance).
+    name: "adjust_note_supply enforces reserve invariant (Phase 7)",
+    cmd: `( grep -q "Error::SupplyUnderflow" contracts/stellar/shielded_pool/src/lib.rs && grep -q "Error::ReserveBroken" contracts/stellar/shielded_pool/src/lib.rs ) && echo "" || echo RESERVE_INVARIANT_MISSING`
   }
 ];
 

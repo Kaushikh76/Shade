@@ -194,6 +194,9 @@ fn cctp_deposit_duplicate_nonce_no_second_note() {
     let asset = sac.address();
     let asset_id = recip_hash(&env, &asset);
     pool.register_asset(&BytesN::from_array(&env, &asset_id), &asset);
+    // The CCTP mint delivers tokens to the pool before receive_cctp_deposit, so
+    // the reserve invariant (supply <= balance) holds when supply is credited.
+    soroban_sdk::token::StellarAssetClient::new(&env, &asset).mint(&pool_id, &1_000_000i128);
 
     let nonce = BytesN::from_array(&env, &[0xA1u8; 32]);
     let enc = BytesN::from_array(&env, &[0xB2u8; 32]);
@@ -237,7 +240,7 @@ fn cctp_deposit_duplicate_nonce_no_second_note() {
 
 /// 18-word withdraw-circuit signals for a CCTP exit (op = WITHDRAW_CCTP) with the
 /// destination bindings at [13..16].
-fn cctp_signals(env: &Env, amount: u128, dest_domain: u128, dest_recip: [u8; 32], max_fee: u128, finality: u128) -> Bytes {
+fn cctp_signals(env: &Env, amount: u128, dest_domain: u128, dest_recip: [u8; 32], max_fee: u128, finality: u128, asset_id: [u8; 32]) -> Bytes {
     let words: [[u8; 32]; 18] = [
         [1u8; 32],               // [0] nullifierHash
         enc_u128(2),             // [1] operationType = WITHDRAW_CCTP
@@ -254,7 +257,7 @@ fn cctp_signals(env: &Env, amount: u128, dest_domain: u128, dest_recip: [u8; 32]
         dest_recip,              // [14] destinationRecipient
         enc_u128(max_fee),       // [15] maxFee
         enc_u128(finality),      // [16] minFinalityThreshold
-        [0u8; 32],               // [17] assetId (unused by withdraw_cctp)
+        asset_id,                // [17] assetId (must be registered USDC)
     ];
     build_signals(env, &words)
 }
@@ -265,10 +268,22 @@ fn withdraw_cctp_rejects_unsupported_domain() {
     let env = &w.env;
     let recip = [0x55u8; 32];
     // proof + arg both use an unsupported domain (99) -> UnsupportedDomain.
-    let signals = cctp_signals(env, 1_000_000, 99, recip, 0, 2000);
+    let signals = cctp_signals(env, 1_000_000, 99, recip, 0, 2000, w.asset_id_bytes);
     let proof = Bytes::from_array(env, &[0u8; 8]);
     let r = w.pool.try_withdraw_cctp(&w.to, &proof, &signals, &99u32, &BytesN::from_array(env, &recip), &0i128, &2000u32);
     assert!(r.is_err(), "an unsupported destination domain must be rejected before burn");
+}
+
+#[test]
+fn withdraw_cctp_rejects_non_usdc_asset() {
+    let w = setup_withdraw();
+    let env = &w.env;
+    let recip = [0x55u8; 32];
+    // A non-USDC note asset id at [17] -> CCTP exit is USDC-only, must reject.
+    let signals = cctp_signals(env, 1_000_000, 3, recip, 0, 2000, [0x99u8; 32]);
+    let proof = Bytes::from_array(env, &[0u8; 8]);
+    let r = w.pool.try_withdraw_cctp(&w.to, &proof, &signals, &3u32, &BytesN::from_array(env, &recip), &0i128, &2000u32);
+    assert!(r.is_err(), "a non-USDC note must not be exitable via CCTP");
 }
 
 #[test]
@@ -276,7 +291,7 @@ fn withdraw_cctp_rejects_relayer_recipient_mutation() {
     let w = setup_withdraw();
     let env = &w.env;
     let recip = [0x55u8; 32];
-    let signals = cctp_signals(env, 1_000_000, 3, recip, 0, 2000);
+    let signals = cctp_signals(env, 1_000_000, 3, recip, 0, 2000, w.asset_id_bytes);
     let proof = Bytes::from_array(env, &[0u8; 8]);
     // relayer swaps the destination recipient -> WrongDestRecipient.
     let r = w.pool.try_withdraw_cctp(&w.to, &proof, &signals, &3u32, &BytesN::from_array(env, &[0xEEu8; 32]), &0i128, &2000u32);
@@ -288,7 +303,7 @@ fn withdraw_cctp_rejects_relayer_fee_mutation() {
     let w = setup_withdraw();
     let env = &w.env;
     let recip = [0x55u8; 32];
-    let signals = cctp_signals(env, 1_000_000, 3, recip, 500, 2000);
+    let signals = cctp_signals(env, 1_000_000, 3, recip, 500, 2000, w.asset_id_bytes);
     let proof = Bytes::from_array(env, &[0u8; 8]);
     // relayer inflates max_fee -> WrongMaxFee.
     let r = w.pool.try_withdraw_cctp(&w.to, &proof, &signals, &3u32, &BytesN::from_array(env, &recip), &9_999i128, &2000u32);
@@ -300,7 +315,7 @@ fn withdraw_cctp_rejects_wrong_finality() {
     let w = setup_withdraw();
     let env = &w.env;
     let recip = [0x55u8; 32];
-    let signals = cctp_signals(env, 1_000_000, 3, recip, 0, 2000);
+    let signals = cctp_signals(env, 1_000_000, 3, recip, 0, 2000, w.asset_id_bytes);
     let proof = Bytes::from_array(env, &[0u8; 8]);
     // relayer changes the finality threshold -> WrongFinality.
     let r = w.pool.try_withdraw_cctp(&w.to, &proof, &signals, &3u32, &BytesN::from_array(env, &recip), &0i128, &1000u32);
@@ -326,34 +341,60 @@ fn recip_hash(env: &Env, to: &Address) -> [u8; 32] {
 struct WithdrawHarness {
     env: Env,
     pool: ShieldedPoolClient<'static>,
+    pool_id: Address,
     to: Address,
     token_admin: soroban_sdk::token::StellarAssetClient<'static>,
-    asset_id: BytesN<32>,
+    asset_id: BytesN<32>,      // == recip_hash(token) — the pool's USDC asset
+    asset_id_bytes: [u8; 32],
 }
 
 fn setup_withdraw() -> WithdrawHarness {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
-    let usdc = Address::generate(&env);
+    // The pool's USDC is a real SAC so it can be minted + registered; its asset id
+    // is recip_hash(token) (matches the withdraw_cctp USDC assertion).
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_addr = sac.address();
     let verifier = env.register(MockVerifierAccept, ()); // accepts the withdraw proof
     let nullreg = env.register(MockNullifierRegistry, ());
     let pool_id = env.register(
         ShieldedPool,
-        (admin.clone(), usdc, verifier, nullreg, 12u32, 1u32, 27u32),
+        (admin.clone(), token_addr.clone(), verifier, nullreg, 12u32, 1u32, 27u32),
     );
     let pool = ShieldedPoolClient::new(&env, &pool_id);
+    let dep_verifier = env.register(MockVerifierAccept, ());
+    pool.set_deposit_verifier(&dep_verifier);
 
-    // Register an asset backed by a real SAC and fund the pool with it.
-    let sac = env.register_stellar_asset_contract_v2(admin.clone());
-    let token_addr = sac.address();
-    let asset_id = BytesN::from_array(&env, &[0x44u8; 32]);
+    let asset_id_bytes = recip_hash(&env, &token_addr);
+    let asset_id = BytesN::from_array(&env, &asset_id_bytes);
     pool.register_asset(&asset_id, &token_addr);
     let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
     token_admin.mint(&pool_id, &10_000_000i128);
 
     let to = Address::generate(&env);
-    WithdrawHarness { env, pool, to, token_admin, asset_id }
+    WithdrawHarness { env, pool, pool_id, to, token_admin, asset_id, asset_id_bytes }
+}
+
+/// Seed per-asset note supply by running a real CCTP deposit (credits supply,
+/// requires vault balance >= amount which the harness has already minted). The
+/// pool must have a deposit verifier set and the asset registered.
+fn seed_deposit(env: &Env, pool: &ShieldedPoolClient<'static>, pool_id: &Address, asset: &Address, asset_id: [u8; 32], amount7: u128, nonce_byte: u8) {
+    let nonce = BytesN::from_array(env, &[nonce_byte; 32]);
+    let enc = BytesN::from_array(env, &[0xB2u8; 32]);
+    let policy = BytesN::from_array(env, &[0xC3u8; 32]);
+    let commitment = BytesN::from_array(env, &[nonce_byte.wrapping_add(1); 32]);
+    let new_root = BytesN::from_array(env, &[nonce_byte.wrapping_add(2); 32]);
+    let amount6 = amount7 / 10;
+    let words: [[u8; 32]; 14] = [
+        commitment.to_array(), enc_u128(4), enc_u128(3), enc_u128(27),
+        hash_field(&nonce.to_array()), enc_u128(1), enc_u128(amount6), enc_u128(amount7),
+        asset_id, recip_hash(env, pool_id), hash_field(&enc.to_array()), hash_field(&policy.to_array()),
+        enc_u128(1), enc_u128(27),
+    ];
+    let signals = build_signals(env, &words);
+    let proof = Bytes::from_array(env, &[0u8; 8]);
+    pool.receive_cctp_deposit(&3u32, &nonce, asset, &(amount7 as i128), &commitment, &new_root, &enc, &policy, &proof, &signals);
 }
 
 /// Build a valid 18-word withdraw public-signal blob (assoc root = 0 default,
@@ -382,13 +423,19 @@ fn withdraw_selects_token_by_asset_and_debits_supply() {
     let w = setup_withdraw();
     let env = &w.env;
     let token = soroban_sdk::token::TokenClient::new(env, &w.token_admin.address);
+    // Seed supply via a deposit (10M note supply, pool already holds 10M tokens).
+    seed_deposit(env, &w.pool, &w.pool_id, &w.token_admin.address, w.asset_id_bytes, 10_000_000, 0x70);
+    assert_eq!(w.pool.note_supply(&w.asset_id), 10_000_000);
     let signals = withdraw_signals(env, &w.to, 4_000_000, w.asset_id.to_array());
     let proof = Bytes::from_array(env, &[0u8; 8]);
 
     w.pool.withdraw(&w.to, &proof, &signals);
 
     assert_eq!(token.balance(&w.to), 4_000_000, "recipient receives the asset's token");
-    assert_eq!(w.pool.note_supply(&w.asset_id), -4_000_000, "note supply debited by withdrawnValue");
+    // Supply debited by withdrawnValue and stays non-negative (reserve invariant).
+    assert_eq!(w.pool.note_supply(&w.asset_id), 6_000_000, "note supply debited by withdrawnValue");
+    let (supply, bal) = w.pool.proof_of_reserves(&w.asset_id);
+    assert!(supply <= bal, "reserve invariant: note_supply <= vault_balance");
 }
 
 #[test]
@@ -407,9 +454,11 @@ fn withdraw_unknown_asset_rejected() {
 struct SwapHarness {
     env: Env,
     pool: ShieldedPoolClient<'static>,
+    pool_id: Address,
     user: Address,
     solver_usdc_to: Address,
     usdc: soroban_sdk::token::TokenClient<'static>,
+    usdc_addr: Address,
     xlm: soroban_sdk::token::TokenClient<'static>,
     usdc_asset: [u8; 32],
     xlm_asset: [u8; 32],
@@ -421,25 +470,27 @@ fn setup_swap() -> SwapHarness {
     let env = Env::default();
     env.mock_all_auths();
     let admin = Address::generate(&env);
+    let usdc_sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let xlm_sac = env.register_stellar_asset_contract_v2(admin.clone());
     let verifier = env.register(MockVerifierAccept, ());
     let nullreg = env.register(MockNullifierRegistry, ());
     let pool_id = env.register(
         ShieldedPool,
-        (admin.clone(), Address::generate(&env), verifier, nullreg, 12u32, 1u32, 27u32),
+        (admin.clone(), usdc_sac.address(), verifier, nullreg, 12u32, 1u32, 27u32),
     );
     let pool = ShieldedPoolClient::new(&env, &pool_id);
+    let dep_verifier = env.register(MockVerifierAccept, ());
+    pool.set_deposit_verifier(&dep_verifier);
 
-    // Two assets: USDC (input) and XLM (output), both funded into the pool.
-    let usdc_sac = env.register_stellar_asset_contract_v2(admin.clone());
-    let xlm_sac = env.register_stellar_asset_contract_v2(admin.clone());
-    let usdc_asset = [0x01u8; 32];
-    let xlm_asset = [0x02u8; 32];
+    // Asset ids are recip_hash(token) so a real deposit (which binds
+    // assetIdHash == recipient_hash(asset)) can seed supply.
+    let usdc_asset = recip_hash(&env, &usdc_sac.address());
+    let xlm_asset = recip_hash(&env, &xlm_sac.address());
     pool.register_asset(&BytesN::from_array(&env, &usdc_asset), &usdc_sac.address());
     pool.register_asset(&BytesN::from_array(&env, &xlm_asset), &xlm_sac.address());
     soroban_sdk::token::StellarAssetClient::new(&env, &usdc_sac.address()).mint(&pool_id, &10_000_000i128);
     soroban_sdk::token::StellarAssetClient::new(&env, &xlm_sac.address()).mint(&pool_id, &50_000_000i128);
 
-    // Authorized solver.
     let solver_sk = keypair(9);
     let solver_pk = pk_bytes(&env, &solver_sk);
     pool.set_authorized_solver(&solver_pk, &true);
@@ -448,8 +499,9 @@ fn setup_swap() -> SwapHarness {
         user: Address::generate(&env),
         solver_usdc_to: Address::generate(&env),
         usdc: soroban_sdk::token::TokenClient::new(&env, &usdc_sac.address()),
+        usdc_addr: usdc_sac.address(),
         xlm: soroban_sdk::token::TokenClient::new(&env, &xlm_sac.address()),
-        usdc_asset, xlm_asset, solver_sk, solver_pk, pool, env,
+        usdc_asset, xlm_asset, solver_sk, solver_pk, pool_id, pool, env,
     }
 }
 
@@ -497,6 +549,8 @@ const PRICE_SCALE_TEST: i128 = 1_000_000_000;
 fn rfq_atomic_swap_delivers_xlm_and_credits_solver() {
     let h = setup_swap();
     let env = &h.env;
+    // Seed USDC note supply (the note being spent must exist in the shielded set).
+    seed_deposit(env, &h.pool, &h.pool_id, &h.usdc_addr, h.usdc_asset, 10_000_000, 0x60);
     let (quote_h, intent_h, fill_h) = ([0x10u8; 32], [0x11u8; 32], [0x12u8; 32]);
     let signals = swap_signals(env, 4_000_000, h.usdc_asset, &quote_h, &intent_h, &fill_h);
     let proof = Bytes::from_array(env, &[0u8; 8]);
@@ -511,7 +565,8 @@ fn rfq_atomic_swap_delivers_xlm_and_credits_solver() {
 
     assert_eq!(h.xlm.balance(&h.user), quoted, "user receives XLM >= min_output");
     assert_eq!(h.usdc.balance(&h.solver_usdc_to), 4_000_000, "solver credited USDC");
-    assert_eq!(h.pool.note_supply(&BytesN::from_array(env, &h.usdc_asset)), -4_000_000, "USDC note left the shielded set");
+    // Seeded 10M USDC supply, spent 4M -> 6M remains (non-negative, reserve holds).
+    assert_eq!(h.pool.note_supply(&BytesN::from_array(env, &h.usdc_asset)), 6_000_000, "USDC note left the shielded set");
 }
 
 #[test]
