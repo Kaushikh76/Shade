@@ -98,6 +98,7 @@ pub enum Error {
     UnderDelivered = 32,    // Phase 3: quoted output < min output
     WrongPrice = 33,        // Phase 3: quoted output != floor(input * priceScaled / PRICE_SCALE)
     UnsupportedDomain = 34, // Phase 4: outbound CCTP destination domain is not supported
+    NotCrossAsset = 35,     // Phase 6: priced settlement input assets are equal (not a cross-asset)
 }
 
 const ADMIN: Symbol = symbol_short!("admin");
@@ -113,6 +114,7 @@ const XVERIFIER: Symbol = symbol_short!("xverifier"); // #2 PrivateTransfer veri
 const DEPVERIFIER: Symbol = symbol_short!("depverif"); // P1.8 DepositNoteMint verifier (separate circuit/vk)
 const MPC_CMTE: Symbol = symbol_short!("mpc_cmte");   // Phase 8: Vec<BytesN<32>> committee ed25519 pubkeys
 const MPC_VERIFIER: Symbol = symbol_short!("mpc_verif"); // Phase C: mpc_settlement Groth16 verifier contract
+const MPC_PVERIFIER: Symbol = symbol_short!("mpc_pverf"); // Phase 6: mpc_priced_settlement Groth16 verifier
 
 #[contracttype]
 enum DataKey {
@@ -920,6 +922,17 @@ impl ShieldedPool {
         env.storage().instance().get(&MPC_VERIFIER)
     }
 
+    /// Phase 6: set the mpc_priced_settlement Groth16 verifier (admin-only).
+    pub fn set_mpc_priced_verifier(env: Env, verifier: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&MPC_PVERIFIER, &verifier);
+    }
+
+    /// Phase 6: return the mpc_priced_settlement verifier address (None = unset).
+    pub fn get_mpc_priced_verifier(env: Env) -> Option<Address> {
+        env.storage().instance().get(&MPC_PVERIFIER)
+    }
+
     /// Settle one matched pair from a committee-signed batch.
     ///
     /// Verification steps:
@@ -954,56 +967,8 @@ impl ShieldedPool {
     ) {
         Self::require_not_paused(&env);
 
-        // Load registered committee from contract storage.
-        let committee: Vec<BytesN<32>> = env.storage().instance()
-            .get(&MPC_CMTE)
-            .unwrap_or_else(|| panic_err(&env, Error::NotInitialized));
-        if committee.len() == 0 {
-            panic_err(&env, Error::NotInitialized);
-        }
-
-        // Threshold = ceil(2n/3).
-        let n = committee.len() as u32;
-        let threshold = (n * 2 + 2) / 3;
-
-        if signer_pubkeys.len() < threshold || signatures.len() < threshold {
-            panic_err(&env, Error::MpcThreshold);
-        }
-
-        // Verify each provided signature against the registered committee set.
-        // ed25519_verify panics if the signature is invalid, aborting the whole tx.
-        // Duplicate signer pubkeys are rejected outright — a replayed/duplicated
-        // signature from one key must never count twice toward the threshold.
-        let msg = Bytes::from_array(&env, &batch_hash.to_array());
-        let mut seen: Vec<BytesN<32>> = Vec::new(&env);
-        let mut verified: u32 = 0;
-        for i in 0..signer_pubkeys.len() {
-            let pk: BytesN<32> = signer_pubkeys.get(i).unwrap();
-            // Check pk is in the registered committee (linear scan; n ≤ 10 in practice).
-            let mut registered = false;
-            for j in 0..committee.len() {
-                if committee.get(j).unwrap() == pk {
-                    registered = true;
-                    break;
-                }
-            }
-            if !registered {
-                panic_err(&env, Error::MpcUnknownSigner);
-            }
-            for j in 0..seen.len() {
-                if seen.get(j).unwrap() == pk {
-                    panic_err(&env, Error::MpcDuplicateSigner);
-                }
-            }
-            seen.push_back(pk.clone());
-            let sig: BytesN<64> = signatures.get(i).unwrap();
-            env.crypto().ed25519_verify(&pk, &msg, &sig);
-            verified += 1;
-        }
-
-        if verified < threshold {
-            panic_err(&env, Error::MpcThreshold);
-        }
+        // Committee threshold over DISTINCT registered signers.
+        Self::verify_committee_threshold(&env, &batch_hash, &signer_pubkeys, &signatures);
 
         // Phase C: ZK proof verification (required when mpc_verifier is configured).
         //
@@ -1119,6 +1084,116 @@ impl ShieldedPool {
         );
     }
 
+    /// Phase 6 (spec §10): settle a PRICED CROSS-ASSET committee match. Party A
+    /// spends `matched_a` of assetX and receives `matched_b` of assetY; party B
+    /// spends `matched_b` of assetY and receives `matched_a` of assetX. The
+    /// mpc_priced_settlement proof enforces the fixed-point price and minOutputs
+    /// in-circuit; this contract binds the committee threshold, canonical ASP
+    /// root, deadline, batch hash, domain, per-asset supply conservation, and the
+    /// asset-pair. Fail-closed: the priced verifier + proof are mandatory once a
+    /// committee exists.
+    ///
+    /// Priced public signals (20): [0] nullifierHashA [1] nullifierHashB
+    /// [2] outputCommitmentA [3] outputCommitmentB [4] stateRoot [5] associationRoot
+    /// [6] batchHash [7] poolId [8] chainId [9] deadlineLedger [10] inputAssetA
+    /// [11] outputAssetA [12] inputAssetB [13] outputAssetB [14] matchedAmountA
+    /// [15] matchedAmountB [16] priceScaled [17] priceScale [18] minOutputA
+    /// [19] minOutputB.
+    pub fn mpc_settle_priced(
+        env: Env,
+        nullifier_a: BytesN<32>,
+        nullifier_b: BytesN<32>,
+        output_commitment_a: BytesN<32>,
+        output_commitment_b: BytesN<32>,
+        new_root: BytesN<32>,
+        batch_hash: BytesN<32>,
+        signer_pubkeys: Vec<BytesN<32>>,
+        signatures: Vec<BytesN<64>>,
+        proof_bytes: Option<Bytes>,
+        pub_signals_bytes: Option<Bytes>,
+    ) {
+        Self::require_not_paused(&env);
+
+        // Committee threshold over DISTINCT registered signers (same as mpc_settle).
+        Self::verify_committee_threshold(&env, &batch_hash, &signer_pubkeys, &signatures);
+
+        // Priced verifier + proof are mandatory (B1, fail-closed).
+        let pverifier: Address = env.storage().instance()
+            .get::<Symbol, Address>(&MPC_PVERIFIER)
+            .unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
+        let pb = proof_bytes.unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
+        let sb = pub_signals_bytes.unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
+        let ok: bool = env.invoke_contract(&pverifier, &Symbol::new(&env, "verify"),
+            vec![&env, pb.to_val(), sb.to_val()]);
+        if !ok { panic_err(&env, Error::MpcProofInvalid); }
+
+        let signals = parse_public_signals(&env, &sb);
+        // Bind the call args to the proof outputs.
+        if signals.get(0).unwrap() != nullifier_a { panic_err(&env, Error::MpcSignalMismatch); }
+        if signals.get(1).unwrap() != nullifier_b { panic_err(&env, Error::MpcSignalMismatch); }
+        if signals.get(2).unwrap() != output_commitment_a { panic_err(&env, Error::MpcSignalMismatch); }
+        if signals.get(3).unwrap() != output_commitment_b { panic_err(&env, Error::MpcSignalMismatch); }
+        // [4] state root known.
+        let state_root: BytesN<32> = signals.get(4).unwrap();
+        if !env.storage().persistent().get(&DataKey::KnownRoot(state_root)).unwrap_or(false) {
+            panic_err(&env, Error::UnknownRoot);
+        }
+        // [5] canonical association root (B2).
+        let assoc_root: BytesN<32> = signals.get(5).unwrap();
+        let canonical: BytesN<32> = env.storage().instance().get(&ASSOCROOT)
+            .unwrap_or_else(|| panic_err(&env, Error::WrongAssociation));
+        if assoc_root != canonical { panic_err(&env, Error::WrongAssociation); }
+        // [6] batch hash field.
+        if signals.get(6).unwrap() != Self::hash_to_field(&env, &batch_hash) {
+            panic_err(&env, Error::MpcSignalMismatch);
+        }
+        // [7][8] domain.
+        let pool_id: u32 = env.storage().instance().get(&POOLID).unwrap();
+        let chain_id: u32 = env.storage().instance().get(&CHAINID).unwrap();
+        if fr32_to_i128(&signals.get(7).unwrap()) != pool_id as i128
+            || fr32_to_i128(&signals.get(8).unwrap()) != chain_id as i128 {
+            panic_err(&env, Error::WrongDomain);
+        }
+        // [9] deadline (B2).
+        if (env.ledger().sequence() as i128) > fr32_to_i128(&signals.get(9).unwrap()) {
+            panic_err(&env, Error::Expired);
+        }
+        // Asset pair: A gives X gets Y, B gives Y gets X, X != Y. The circuit
+        // already enforces outputAssetA==inputAssetB and outputAssetB==inputAssetA;
+        // here also require both to be REGISTERED assets and a genuine cross-asset.
+        let input_a: BytesN<32> = signals.get(10).unwrap();  // X
+        let input_b: BytesN<32> = signals.get(12).unwrap();  // Y
+        if input_a == input_b { panic_err(&env, Error::NotCrossAsset); }
+        // Fail closed on an unregistered asset.
+        let _ = Self::get_asset_token(env.clone(), input_a.clone());
+        let _ = Self::get_asset_token(env.clone(), input_b.clone());
+        let matched_a: i128 = fr32_to_i128(&signals.get(14).unwrap()); // X spent by A
+        let matched_b: i128 = fr32_to_i128(&signals.get(15).unwrap()); // Y spent by B
+
+        // Spend both nullifiers once.
+        let nullreg: Address = env.storage().instance().get(&NULLREG).unwrap();
+        let _: bool = env.invoke_contract(&nullreg, &Symbol::new(&env, "spend"),
+            vec![&env, env.current_contract_address().to_val(), nullifier_a.clone().to_val()]);
+        let _: bool = env.invoke_contract(&nullreg, &Symbol::new(&env, "spend"),
+            vec![&env, env.current_contract_address().to_val(), nullifier_b.clone().to_val()]);
+
+        // Per-asset supply is CONSERVED for a private cross-asset crossing: assetX
+        // note A (matched_a) is destroyed and an assetX output note B (matched_a) is
+        // created; likewise assetY. Net supply per asset is unchanged, so no
+        // adjustment is needed — but assert the amounts are positive.
+        if matched_a <= 0 || matched_b <= 0 { panic_err(&env, Error::BadAmount); }
+
+        let leaf_count: u32 = env.storage().instance().get(&LEAF_COUNT_KEY).unwrap_or(0u32);
+        env.storage().instance().set(&LEAF_COUNT_KEY, &(leaf_count + 2));
+        env.storage().persistent().set(&DataKey::KnownRoot(new_root.clone()), &true);
+        env.storage().instance().set(&TREE_ROOT_KEY, &new_root);
+
+        env.events().publish(
+            (symbol_short!("mpcprice"), batch_hash),
+            (nullifier_a, nullifier_b, output_commitment_a, output_commitment_b, new_root),
+        );
+    }
+
     pub fn is_known_root(env: Env, root: BytesN<32>) -> bool {
         env.storage().persistent().get(&DataKey::KnownRoot(root)).unwrap_or(false)
     }
@@ -1163,6 +1238,49 @@ impl ShieldedPool {
     fn require_admin(env: &Env) {
         let admin: Address = env.storage().instance().get(&ADMIN).unwrap();
         admin.require_auth();
+    }
+
+    /// Shared committee-signature check used by mpc_settle and mpc_settle_priced.
+    /// Requires >= ceil(2n/3) DISTINCT registered committee ed25519 signatures over
+    /// `batch_hash`. Duplicate or unregistered signers, or too few, abort the tx.
+    fn verify_committee_threshold(
+        env: &Env,
+        batch_hash: &BytesN<32>,
+        signer_pubkeys: &Vec<BytesN<32>>,
+        signatures: &Vec<BytesN<64>>,
+    ) {
+        let committee: Vec<BytesN<32>> = env.storage().instance()
+            .get(&MPC_CMTE)
+            .unwrap_or_else(|| panic_err(env, Error::NotInitialized));
+        if committee.len() == 0 {
+            panic_err(env, Error::NotInitialized);
+        }
+        let n = committee.len() as u32;
+        let threshold = (n * 2 + 2) / 3; // ceil(2n/3)
+        if signer_pubkeys.len() < threshold || signatures.len() < threshold {
+            panic_err(env, Error::MpcThreshold);
+        }
+        let msg = Bytes::from_array(env, &batch_hash.to_array());
+        let mut seen: Vec<BytesN<32>> = Vec::new(env);
+        let mut verified: u32 = 0;
+        for i in 0..signer_pubkeys.len() {
+            let pk: BytesN<32> = signer_pubkeys.get(i).unwrap();
+            let mut registered = false;
+            for j in 0..committee.len() {
+                if committee.get(j).unwrap() == pk { registered = true; break; }
+            }
+            if !registered { panic_err(env, Error::MpcUnknownSigner); }
+            for j in 0..seen.len() {
+                if seen.get(j).unwrap() == pk { panic_err(env, Error::MpcDuplicateSigner); }
+            }
+            seen.push_back(pk.clone());
+            let sig: BytesN<64> = signatures.get(i).unwrap();
+            env.crypto().ed25519_verify(&pk, &msg, &sig);
+            verified += 1;
+        }
+        if verified < threshold {
+            panic_err(env, Error::MpcThreshold);
+        }
     }
     fn require_not_paused(env: &Env) {
         if env.storage().instance().get(&PAUSED).unwrap_or(false) {

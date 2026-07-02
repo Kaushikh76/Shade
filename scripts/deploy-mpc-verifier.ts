@@ -76,6 +76,29 @@ console.log(`Wiring pool.set_mpc_verifier(${env.MPC_VERIFIER_CONTRACT})…`);
 invoke(deployer, pool, ["set_mpc_verifier", "--verifier", env.MPC_VERIFIER_CONTRACT]);
 console.log("Pool wired: mpc_settle now requires a Groth16 proof alongside committee sigs.");
 
+// Phase 6: deploy + wire the mpc_priced_settlement verifier for cross-asset MPC.
+const pvkPath = resolve(SHADE_ROOT, "circuits/mpc_priced_settlement/output/main_verification_key.json");
+if (existsSync(pvkPath)) {
+  if (!env.MPC_PRICED_VERIFIER_CONTRACT) {
+    const pvkBytes = execFileSync(C2S, ["vk", pvkPath], { encoding: "utf8" }).trim();
+    console.log("Deploying mpc_priced_settlement verifier…");
+    env.MPC_PRICED_VERIFIER_CONTRACT = deploy(
+      resolve(WASM_DIR, "proof_verifiers.wasm"),
+      ["--admin", deployerPub, "--vk_bytes", pvkBytes],
+      deployer
+    );
+    writeEnv();
+    console.log(`MPC_PRICED_VERIFIER_CONTRACT: ${env.MPC_PRICED_VERIFIER_CONTRACT}`);
+  } else {
+    console.log(`MPC_PRICED_VERIFIER_CONTRACT: reuse ${env.MPC_PRICED_VERIFIER_CONTRACT}`);
+  }
+  console.log(`Wiring pool.set_mpc_priced_verifier(${env.MPC_PRICED_VERIFIER_CONTRACT})…`);
+  invoke(deployer, pool, ["set_mpc_priced_verifier", "--verifier", env.MPC_PRICED_VERIFIER_CONTRACT]);
+  console.log("Pool wired: mpc_settle_priced now requires a Groth16 proof.");
+} else {
+  console.log(`mpc_priced_settlement vk not found (${pvkPath}); skipping priced verifier. Run npm run circuits:build.`);
+}
+
 console.log("Phase C deploy PASS");
 
 // ---- helpers ----
@@ -158,7 +181,7 @@ function writeEnv() {
   for (const k of [
     "VERIFIER_WITHDRAW_CONTRACT", "TRANSFER_VERIFIER_CONTRACT",
     "VERIFIER_DEPOSIT_NOTE_MINT_CONTRACT", "SHIELDED_POOL_CONTRACT",
-    "MPC_VERIFIER_CONTRACT"
+    "MPC_VERIFIER_CONTRACT", "MPC_PRICED_VERIFIER_CONTRACT"
   ]) {
     if (env[k]) existing[k] = env[k];
   }

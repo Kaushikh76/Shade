@@ -127,6 +127,12 @@ const gates: Gate[] = [
     // Phase 4: outbound CCTP must gate unsupported destination domains before burn.
     name: "withdraw_cctp gates unsupported destination domain (Phase 4)",
     cmd: `grep -q "Error::UnsupportedDomain" contracts/stellar/shielded_pool/src/lib.rs && echo "" || echo CCTP_DOMAIN_GATE_MISSING`
+  },
+  {
+    // Phase 6: priced cross-asset MPC requires a mandatory dedicated verifier and
+    // rejects a same-asset "priced" settlement.
+    name: "mpc_settle_priced is fail-closed cross-asset (Phase 6)",
+    cmd: `( grep -q "fn mpc_settle_priced" contracts/stellar/shielded_pool/src/lib.rs && grep -q "MPC_PVERIFIER" contracts/stellar/shielded_pool/src/lib.rs && grep -q "Error::NotCrossAsset" contracts/stellar/shielded_pool/src/lib.rs ) && echo "" || echo MPC_PRICED_MISSING`
   }
 ];
 

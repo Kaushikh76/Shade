@@ -904,3 +904,186 @@ fn mpc_settle_rejects_missing_proof_when_verifier_configured() {
     );
     assert!(result.is_err(), "valid committee sigs alone must not settle once a ZK verifier is configured — a proof is mandatory");
 }
+
+// ---- Phase 6 priced cross-asset MPC settlement (spec §10) ----
+
+struct PricedHarness {
+    h: Harness,
+    signer_pubkeys: Vec<BytesN<32>>,
+    signatures: Vec<BytesN<64>>,
+    batch_hash: BytesN<32>,
+    batch_arr: [u8; 32],
+    assoc: [u8; 32],
+    proof: Bytes,
+    asset_x: [u8; 32],
+    asset_y: [u8; 32],
+    na: BytesN<32>, nb: BytesN<32>, oa: BytesN<32>, ob: BytesN<32>, new_root: BytesN<32>,
+}
+
+fn setup_priced(accept: bool) -> PricedHarness {
+    let h = setup();
+    let env = &h.env;
+    let sk1 = keypair(1); let sk2 = keypair(2); let sk3 = keypair(3);
+    let pk1 = pk_bytes(env, &sk1); let pk2 = pk_bytes(env, &sk2); let pk3 = pk_bytes(env, &sk3);
+    h.pool.set_committee(&Vec::from_array(env, [pk1.clone(), pk2.clone(), pk3.clone()]));
+
+    let pv = if accept { env.register(MockVerifierAccept, ()) } else { env.register(MockVerifierReject, ()) };
+    h.pool.set_mpc_priced_verifier(&pv);
+
+    let assoc = [9u8; 32];
+    h.pool.set_association_root(&BytesN::from_array(env, &assoc));
+
+    // Register both assets (cross-asset requires each registered).
+    let sacx = env.register_stellar_asset_contract_v2(Address::generate(env));
+    let sacy = env.register_stellar_asset_contract_v2(Address::generate(env));
+    let asset_x = [0x01u8; 32];
+    let asset_y = [0x02u8; 32];
+    h.pool.register_asset(&BytesN::from_array(env, &asset_x), &sacx.address());
+    h.pool.register_asset(&BytesN::from_array(env, &asset_y), &sacy.address());
+
+    let batch_arr = [7u8; 32];
+    let batch_hash = BytesN::from_array(env, &batch_arr);
+    let sig1 = sign_hash(env, &sk1, &batch_hash);
+    let sig2 = sign_hash(env, &sk2, &batch_hash);
+    PricedHarness {
+        signer_pubkeys: Vec::from_array(env, [pk1, pk2]),
+        signatures: Vec::from_array(env, [sig1, sig2]),
+        batch_hash, batch_arr, assoc, asset_x, asset_y,
+        proof: Bytes::from_array(env, &[0xabu8; 8]),
+        na: BytesN::from_array(env, &[0x11u8; 32]),
+        nb: BytesN::from_array(env, &[0x12u8; 32]),
+        oa: BytesN::from_array(env, &[0x13u8; 32]),
+        ob: BytesN::from_array(env, &[0x14u8; 32]),
+        new_root: BytesN::from_array(env, &[0x15u8; 32]),
+        h,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn priced_signals(p: &PricedHarness, asset_x: [u8; 32], asset_y: [u8; 32], batch: &[u8; 32], deadline: u128) -> Bytes {
+    let env = &p.h.env;
+    // A gives X gets Y; B gives Y gets X. matched_a=X spent, matched_b=Y spent.
+    let words: [[u8; 32]; 20] = [
+        p.na.to_array(),          // [0] nullifierHashA
+        p.nb.to_array(),          // [1] nullifierHashB
+        p.oa.to_array(),          // [2] outputCommitmentA
+        p.ob.to_array(),          // [3] outputCommitmentB
+        [0u8; 32],                // [4] stateRoot (empty, known)
+        p.assoc,                  // [5] associationRoot
+        hash_field(batch),        // [6] batchHash
+        enc_u128(1),              // [7] poolId
+        enc_u128(27),             // [8] chainId
+        enc_u128(deadline),       // [9] deadlineLedger
+        asset_x,                  // [10] inputAssetA (X)
+        asset_y,                  // [11] outputAssetA (Y)
+        asset_y,                  // [12] inputAssetB (Y)
+        asset_x,                  // [13] outputAssetB (X)
+        enc_u128(4_000_000),      // [14] matchedAmountA (X)
+        enc_u128(2_000_000),      // [15] matchedAmountB (Y)
+        enc_u128(500_000_000),    // [16] priceScaled
+        enc_u128(1_000_000_000),  // [17] priceScale
+        enc_u128(1_900_000),      // [18] minOutputA
+        enc_u128(3_900_000),      // [19] minOutputB
+    ];
+    build_signals(env, &words)
+}
+
+#[test]
+fn mpc_settle_priced_accepts_valid_cross_asset() {
+    let p = setup_priced(true);
+    let env = &p.h.env;
+    let signals = priced_signals(&p, p.asset_x, p.asset_y, &p.batch_arr, 999_999);
+    let r = p.h.pool.try_mpc_settle_priced(
+        &p.na, &p.nb, &p.oa, &p.ob, &p.new_root, &p.batch_hash,
+        &p.signer_pubkeys, &p.signatures, &Some(p.proof.clone()), &Some(signals),
+    );
+    assert!(r.is_ok(), "valid priced cross-asset settlement must succeed: {:?}", r);
+}
+
+#[test]
+fn mpc_settle_priced_rejects_same_asset() {
+    let p = setup_priced(true);
+    let env = &p.h.env;
+    // inputAssetA == inputAssetB (X == X) -> NotCrossAsset.
+    let signals = priced_signals(&p, p.asset_x, p.asset_x, &p.batch_arr, 999_999);
+    let r = p.h.pool.try_mpc_settle_priced(
+        &p.na, &p.nb, &p.oa, &p.ob, &p.new_root, &p.batch_hash,
+        &p.signer_pubkeys, &p.signatures, &Some(p.proof.clone()), &Some(signals),
+    );
+    assert!(r.is_err(), "a same-asset 'priced' settlement must be rejected (use mpc_settle)");
+}
+
+#[test]
+fn mpc_settle_priced_rejects_unregistered_asset() {
+    let p = setup_priced(true);
+    let env = &p.h.env;
+    // asset_y not registered -> get_asset_token fails closed.
+    let unreg = [0xEEu8; 32];
+    let signals = priced_signals(&p, p.asset_x, unreg, &p.batch_arr, 999_999);
+    let r = p.h.pool.try_mpc_settle_priced(
+        &p.na, &p.nb, &p.oa, &p.ob, &p.new_root, &p.batch_hash,
+        &p.signer_pubkeys, &p.signatures, &Some(p.proof.clone()), &Some(signals),
+    );
+    assert!(r.is_err(), "priced settlement with an unregistered asset must fail closed");
+}
+
+#[test]
+fn mpc_settle_priced_rejects_missing_proof() {
+    let p = setup_priced(true);
+    let r = p.h.pool.try_mpc_settle_priced(
+        &p.na, &p.nb, &p.oa, &p.ob, &p.new_root, &p.batch_hash,
+        &p.signer_pubkeys, &p.signatures, &None, &None,
+    );
+    assert!(r.is_err(), "priced settlement without a proof must be rejected (fail closed)");
+}
+
+#[test]
+fn mpc_settle_priced_rejects_invalid_proof() {
+    let p = setup_priced(false); // rejecting verifier
+    let env = &p.h.env;
+    let signals = priced_signals(&p, p.asset_x, p.asset_y, &p.batch_arr, 999_999);
+    let r = p.h.pool.try_mpc_settle_priced(
+        &p.na, &p.nb, &p.oa, &p.ob, &p.new_root, &p.batch_hash,
+        &p.signer_pubkeys, &p.signatures, &Some(p.proof.clone()), &Some(signals),
+    );
+    assert!(r.is_err(), "a verifier-rejected priced proof must not settle");
+}
+
+#[test]
+fn mpc_settle_priced_rejects_wrong_association_root() {
+    let p = setup_priced(true);
+    let env = &p.h.env;
+    let mut signals_words = priced_signals(&p, p.asset_x, p.asset_y, &p.batch_arr, 999_999);
+    let _ = &mut signals_words;
+    // Rebuild with a wrong association root at [5].
+    let words_bad = {
+        let env = &p.h.env;
+        let w: [[u8; 32]; 20] = [
+            p.na.to_array(), p.nb.to_array(), p.oa.to_array(), p.ob.to_array(),
+            [0u8; 32], [0xAAu8; 32] /* wrong assoc */, hash_field(&p.batch_arr),
+            enc_u128(1), enc_u128(27), enc_u128(999_999),
+            p.asset_x, p.asset_y, p.asset_y, p.asset_x,
+            enc_u128(4_000_000), enc_u128(2_000_000), enc_u128(500_000_000), enc_u128(1_000_000_000),
+            enc_u128(1_900_000), enc_u128(3_900_000),
+        ];
+        build_signals(env, &w)
+    };
+    let r = p.h.pool.try_mpc_settle_priced(
+        &p.na, &p.nb, &p.oa, &p.ob, &p.new_root, &p.batch_hash,
+        &p.signer_pubkeys, &p.signatures, &Some(p.proof.clone()), &Some(words_bad),
+    );
+    assert!(r.is_err(), "priced settlement binding a non-canonical association root must be rejected");
+}
+
+#[test]
+fn mpc_settle_priced_rejects_expired_deadline() {
+    let p = setup_priced(true);
+    let env = &p.h.env;
+    env.ledger().with_mut(|li| li.sequence_number = 1000);
+    let signals = priced_signals(&p, p.asset_x, p.asset_y, &p.batch_arr, 10);
+    let r = p.h.pool.try_mpc_settle_priced(
+        &p.na, &p.nb, &p.oa, &p.ob, &p.new_root, &p.batch_hash,
+        &p.signer_pubkeys, &p.signatures, &Some(p.proof.clone()), &Some(signals),
+    );
+    assert!(r.is_err(), "an expired priced settlement deadline must be rejected");
+}

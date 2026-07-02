@@ -35,6 +35,9 @@ export function depositCircuitDir(): string {
 export function mpcSettlementCircuitDir(): string {
   return process.env.MPC_SETTLEMENT_CIRCUIT_DIR || resolve(CIRCUIT_BUILD_DIR, "mpc_settlement");
 }
+export function mpcPricedSettlementCircuitDir(): string {
+  return process.env.MPC_PRICED_SETTLEMENT_CIRCUIT_DIR || resolve(CIRCUIT_BUILD_DIR, "mpc_priced_settlement");
+}
 
 let scratchEnsured = false;
 export function scratchDir(): string {

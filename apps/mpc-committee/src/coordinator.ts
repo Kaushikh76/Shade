@@ -69,6 +69,97 @@ export function matchIntents(
   return matches;
 }
 
+// ---------- Phase 6: priced cross-asset matching (spec §10.4) ----------
+// Match a party spending assetX (wanting assetY) with a party spending assetY
+// (wanting assetX) at a single fixed price, no partial fills. A crossing exists
+// when the assetX-seller's ask price <= the assetY-seller's implied bid, i.e. the
+// amounts are consistent with ONE priceScaled within the floor rounding rule:
+//   amountY == floor(amountX * priceScaled / PRICE_SCALE).
+// PRICE_SCALE = 1e9.
+
+const PRICE_SCALE = 1_000_000_000n;
+
+export type PricedIntent = {
+  intentId: string;
+  inputAsset: string;   // asset this party spends
+  outputAsset: string;  // asset this party wants
+  amount: bigint;       // amount of inputAsset spent (full note value, no partial fills)
+  minOutput: bigint;    // minimum acceptable outputAsset
+  // Limit price as outputAsset units per inputAsset unit * PRICE_SCALE. The party
+  // accepts any fill giving >= this rate.
+  limitPriceScaled: bigint;
+};
+
+export type PricedMatch = {
+  intentAId: string;   // spends assetX
+  intentBId: string;   // spends assetY
+  inputAssetA: string; // X
+  outputAssetA: string;// Y
+  inputAssetB: string; // Y
+  outputAssetB: string;// X
+  matchedAmountA: string; // X
+  matchedAmountB: string; // Y
+  priceScaled: string;    // Y per X * 1e9
+  minOutputA: string;
+  minOutputB: string;
+};
+
+// Match A (spends X, wants Y) with B (spends Y, wants X) at price = A.limitPrice.
+// Returns null when the pair does not cross.
+export function matchPricedPair(a: PricedIntent, b: PricedIntent): PricedMatch | null {
+  // Cross-asset complementary: A gives X wants Y; B gives Y wants X; X != Y.
+  if (a.inputAsset !== b.outputAsset) return null;
+  if (a.outputAsset !== b.inputAsset) return null;
+  if (a.inputAsset === a.outputAsset) return null;
+
+  // Settle at A's limit price (Y per X). B receives A's full X = a.amount.
+  const priceScaled = a.limitPriceScaled;
+  const outputForA = (a.amount * priceScaled) / PRICE_SCALE; // Y to A
+  const outputForB = a.amount;                               // X to B
+
+  // No partial fills: B must be spending exactly the Y that A receives.
+  if (b.amount !== outputForA) return null;
+  // Both parties' min-outputs satisfied.
+  if (outputForA < a.minOutput) return null;
+  if (outputForB < b.minOutput) return null;
+  // B's limit (X per Y) must accept this rate: X_to_B / Y_spent >= B.limit.
+  const rateForB = (outputForB * PRICE_SCALE) / b.amount;
+  if (rateForB < b.limitPriceScaled) return null;
+
+  return {
+    intentAId: a.intentId,
+    intentBId: b.intentId,
+    inputAssetA: a.inputAsset,  outputAssetA: a.outputAsset,
+    inputAssetB: b.inputAsset,  outputAssetB: b.outputAsset,
+    matchedAmountA: a.amount.toString(),
+    matchedAmountB: outputForA.toString(),
+    priceScaled: priceScaled.toString(),
+    minOutputA: a.minOutput.toString(),
+    minOutputB: b.minOutput.toString()
+  };
+}
+
+// Greedy priced matching over a set of intents (no partial fills). Each intent is
+// used at most once; returns the crossed pairs.
+export function matchPricedIntents(intents: PricedIntent[]): PricedMatch[] {
+  const out: PricedMatch[] = [];
+  const used = new Set<string>();
+  for (let i = 0; i < intents.length; i++) {
+    if (used.has(intents[i].intentId)) continue;
+    for (let j = 0; j < intents.length; j++) {
+      if (i === j || used.has(intents[j].intentId) || used.has(intents[i].intentId)) continue;
+      const m = matchPricedPair(intents[i], intents[j]);
+      if (m) {
+        out.push(m);
+        used.add(intents[i].intentId);
+        used.add(intents[j].intentId);
+        break;
+      }
+    }
+  }
+  return out;
+}
+
 // ---------- Coordinator ----------
 
 export type CoordinatorResult =

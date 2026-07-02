@@ -1,8 +1,9 @@
 # MPC Settlement
 
-> Testnet only; no mainnet claim. **MPC supports same-asset private crossing
-> only. USDC→XLM is the RFQ route** (see `docs/RFQ_USDC_XLM.md`). MPC dev mode is
-> not a distributed trust model. Spec: §9 (same-asset), §10 (priced cross-asset).
+> Testnet only; no mainnet claim. MPC supports **same-asset** private crossing
+> (§9) and **priced cross-asset** USDC↔XLM crossing (§10). USDC→XLM is ALSO
+> available via the atomic RFQ route (see `docs/RFQ_USDC_XLM.md`). MPC dev mode is
+> not a distributed trust model.
 
 ## Same-asset crossing (§9) — implemented
 
@@ -44,19 +45,43 @@ batch → reject. Shamir + batch-hash + matcher unit tests in `@shade/mpc-crypto
   `coordinator-server.ts` (holds no secret keys) — the real distributed path,
   requiring independent operators.
 
-## Priced cross-asset crossing (§10) — DESCOPED
+## Priced cross-asset crossing (§10) — implemented
 
-MPC priced USDC↔XLM crossing is **not implemented** and is explicitly out of
-scope for this milestone (spec §10.7 permits keeping MPC same-asset only). The
-current `mpc_settlement` circuit conserves value for a same-unit crossing
-(`outValueA + outValueB == 2·matchedAmount`); a priced cross-asset crossing needs
-a different circuit (price + asset-pair constraints), coordinator price matching,
-and an extended batch hash.
+Party A spends `matchedAmountA` of assetX and receives `matchedAmountB` of
+assetY; party B spends assetY and receives assetX, at a fixed price.
 
-**USDC→XLM is served by the atomic RFQ path** (Phase 3), which is implemented and
-tested. The acceptance suite (`e2e:testnet:all`) prints
-`MPC priced cross-asset not implemented; RFQ is the USDC->XLM route.` and no code
-or docs claim MPC supports USDC↔XLM.
+Circuit `mpc_priced_settlement` (`nPublic=20`) enforces:
+- asset pairing `outputAssetA==inputAssetB`, `outputAssetB==inputAssetA`, and
+  `inputAssetA != inputAssetB` (a genuine cross-asset);
+- fixed-point price `matchedAmountB == floor(matchedAmountA·priceScaled/priceScale)`
+  with `priceScale == 1e9` (`0 <= A·price − B·scale < scale`);
+- `minOutputA`/`minOutputB` protections (each party receives at least its min);
+- asset-bound commitments for all four notes, Merkle membership of both inputs,
+  ASP membership of both labels, domain-separated nullifiers.
 
-Same-asset MPC testnet E2E (two USDC notes → two USDC output notes → withdraw)
-runs in the Phase 8 acceptance suite.
+Contract `shielded_pool::mpc_settle_priced` binds (fail-closed): committee
+threshold over distinct registered signers, a MANDATORY `mpc_priced_settlement`
+proof (dedicated verifier), canonical association root, non-expired deadline,
+batch hash, poolId/chainId, both assets registered and distinct. Per-asset supply
+is conserved (an assetX input note is replaced by an assetX output note, likewise
+assetY), so no net supply change.
+
+Coordinator `matchPricedIntents` / `matchPricedPair` cross a party spending X
+(wanting Y) with a party spending Y (wanting X) at a single price, no partial
+fills, respecting both parties' limit prices and min-outputs; the price is bound
+into `computeBatchHash` (§10.5).
+
+### Tests
+
+- Circuit (`circuits:test`): valid cross-asset proof verifies; wrong output
+  amount, wrong price, minOutput violation, and wrong asset pair all fail witness
+  generation (§10.6).
+- Contract (`shielded_pool/src/tests.rs`): valid priced settle accepted; rejects
+  same-asset, unregistered asset, missing proof, invalid proof, wrong association
+  root, expired deadline.
+- Coordinator (`priced-matcher:test`): crossing matches with price bound;
+  non-crossing / partial-fill / unmet-limit rejected; price change flips the
+  batch hash.
+
+USDC→XLM is ALSO served by the atomic RFQ path (Phase 3). Same-asset and priced
+cross-asset MPC testnet E2E run in the Phase 8 acceptance suite.

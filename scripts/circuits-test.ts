@@ -69,6 +69,54 @@ try {
   checks.push({ name: "deposit_note_mint proof verifies + commitment bound", ok: dproof.locallyVerified && commitOk, detail: dproof.locallyVerified ? (commitOk ? "OK" : "commitment mismatch") : "verify FAILED" });
 } catch (e) { checks.push({ name: "deposit_note_mint proof verifies + commitment bound", ok: false, detail: (e as Error).message.slice(0, 160) }); }
 
+// Phase 6 (spec §10.6): priced cross-asset circuit — valid proof verifies; wrong
+// price / wrong output amount / minOutput violation / wrong asset pair all fail
+// witness generation (the circuit constraints reject them).
+try {
+  const { generateCoin } = await import("../apps/cli/src/lib/prove.js");
+  const { buildMpcPricedProof, calcPricedWitness } = await import("@shade/proving");
+  const { ASSETS } = await import("@shade/assets");
+  const bh = "0x" + "ab".repeat(32);
+
+  // Two notes of equal value (coinutils fixed denomination) in different assets:
+  // price = 1e9 (1.0) so matchedA == matchedB.
+  const coinX = generateCoin("ptest_priced_x", `${SCRATCH}/priced_x.json`, ASSETS.USDC.assetIdField);
+  const coinY = generateCoin("ptest_priced_y", `${SCRATCH}/priced_y.json`, ASSETS.XLM.assetIdField);
+  const assocX = buildAssociationSet(coinX, SCRATCH, "priced_x");
+  // Association set must contain BOTH labels; rebuild including coinY's label.
+  const labelX = JSON.parse(readFileSync(coinX.path, "utf8")).coin.label as string;
+  const labelY = JSON.parse(readFileSync(coinY.path, "utf8")).coin.label as string;
+  // buildAssociationSet appends; add coinY's label to the same file.
+  const { execFileSync } = await import("node:child_process");
+  const { COINUTILS } = await import("@shade/proving");
+  execFileSync(COINUTILS, ["update-association", assocX.assocPath, labelY], { encoding: "utf8" });
+  void labelX;
+
+  const commitments = [coinX.commitmentDecimal, coinY.commitmentDecimal];
+  const base = {
+    coinX, coinY, commitmentsDecimal: commitments, assocPath: assocX.assocPath,
+    scope: "ptest_priced_x", batchHashHex: bh, poolId: "1", chainId: "27",
+    priceScaled: "1000000000", minOutputA: "1", minOutputB: "1",
+    deadlineLedger: "999999999", scratch: SCRATCH, tag: "priced_ok"
+  };
+  const pr = buildMpcPricedProof(base);
+  checks.push({ name: "mpc_priced_settlement proof verifies (cross-asset)", ok: pr.locallyVerified, detail: pr.locallyVerified ? "OK" : "verify FAILED" });
+
+  // Adversarial: tamper the VALID witness so a constraint is violated, and assert
+  // witness generation now FAILS (fail-closed at the circuit level).
+  const tamper = (mut: (w: Record<string, unknown>) => void, tag: string): boolean => {
+    const w = JSON.parse(JSON.stringify(pr.witnessJson)) as Record<string, unknown>;
+    mut(w);
+    try { calcPricedWitness(w, SCRATCH, tag); return false; } catch { return true; }
+  };
+  checks.push({ name: "priced: wrong output amount rejected", ok: tamper((w) => { w.matchedAmountB = "1"; }, "adv_out"), detail: "" });
+  checks.push({ name: "priced: wrong price rejected", ok: tamper((w) => { w.priceScaled = "500000000"; }, "adv_price"), detail: "" });
+  checks.push({ name: "priced: minOutput violation rejected", ok: tamper((w) => { w.minOutputA = "999999999999"; }, "adv_min"), detail: "" });
+  checks.push({ name: "priced: wrong asset pair rejected (outputAssetA != inputAssetB)", ok: tamper((w) => { w.outputAssetA = ASSETS.USDC.assetIdField; }, "adv_pair"), detail: "" });
+} catch (e) {
+  checks.push({ name: "mpc_priced_settlement proof verifies (cross-asset)", ok: false, detail: (e as Error).message.slice(0, 200) });
+}
+
 beginReport({ title: "Circuit Tests" });
 await writeCheckReport("Circuit Tests (prove + local verify)", checks);
 for (const c of checks) console.log(`${c.ok ? "PASS" : "FAIL"}  ${c.name}${c.detail ? " — " + c.detail : ""}`);

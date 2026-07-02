@@ -45,7 +45,7 @@ const SCENARIOS: Scenario[] = [
   { id: "F6", phase: "7", name: "Remit simulated INR quote -> receipt", kind: "functional", command: null },
   { id: "F7", phase: "7", name: "Shade View report verifies against F1-F4", kind: "functional", command: null },
   { id: "F8", phase: "7", name: "Recovery: wipe client -> recover notes", kind: "functional", command: null },
-  { id: "F9", phase: "6", name: "MPC priced cross-asset USDC<->XLM", kind: "functional", command: null, optional: true },
+  { id: "F9", phase: "6", name: "MPC priced cross-asset USDC<->XLM", kind: "functional", command: null },
 
   // ---- Adversarial (spec §12.3) ----
   { id: "A1", phase: "4", name: "duplicate CCTP nonce -> no second note", kind: "adversarial", command: null },
@@ -104,11 +104,6 @@ for (const s of SCENARIOS) {
   if (status === "SKIPPED_NO_TESTNET") skipped++;
 }
 
-// Optional MPC priced cross-asset banner (spec §12.2.9 / §10.7).
-const f9 = SCENARIOS.find((s) => s.id === "F9")!;
-if (f9.command === null) {
-  console.log("\nMPC priced cross-asset not implemented; RFQ is the USDC->XLM route.");
-}
 
 const summary = [
   "",

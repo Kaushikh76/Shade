@@ -36,6 +36,7 @@ const CIRCUITS: { name: string; nPublic: number }[] = [
   { name: "deposit_note_mint", nPublic: 14 }, // 1 output + 13 inputs (assetIdHash already public)
   { name: "proof_of_fill_claim", nPublic: 11 }, // 1 output (claimId) + 10 public inputs
   { name: "mpc_settlement",    nPublic: 12 }, // 4 outputs + 7 public inputs + Phase 2/5 assetId
+  { name: "mpc_priced_settlement", nPublic: 20 }, // Phase 6: 4 outputs + 16 public inputs (priced cross-asset)
 ];
 
 const checks: CheckResult[] = [];
