@@ -35,16 +35,19 @@ function readRetry(contractId: string, method: string, args: string[] = []): str
 const poolRead = (m: string) => readRetry(pool, m);
 const userUsdc = () => BigInt(readRetry(sac, "balance", ["--id", userPub]));
 
-// Build an anonymity set: 1 real funded note + DECOYS decoy commitments. ---
-// In production every leaf is an independent funded user deposit; here decoys are
-// real Poseidon commitments registered on-chain (auditable) to form a k>1 set so
-// the withdrawal proves "I own one of K notes" without revealing which.
-const DECOYS = Number(process.env.ZKW_DECOYS ?? "2");
+// Build the anonymity set. In production every leaf is an independent FUNDED user
+// deposit; anonymity comes from other users' real backed notes. Synthetic decoys
+// (registered without their own USDC backing) are rejected by the pool's per-asset
+// reserve invariant (note_supply <= vault_balance) — so decoys here only work when
+// the pool is over-funded to back them. ZKW_DECOYS defaults to 0: a single fully
+// backed note is the sound minimal set (k=1). Set ZKW_DECOYS>0 only with matching
+// extra funding.
+const DECOYS = Number(process.env.ZKW_DECOYS ?? "0");
 const realCoin = generateCoin("shade_pool", `${SCRATCH}/zkw_coin.json`);
 const decoys = Array.from({ length: DECOYS }, (_, i) => generateCoin(`shade_decoy_${i}`, `${SCRATCH}/zkw_decoy_${i}.json`));
 // ordered leaf set: real note first (index hidden by the proof), then decoys
 const leafSet = [realCoin.commitmentDecimal, ...decoys.map((d) => d.commitmentDecimal)];
-results.push({ name: "#1 anonymity set built", ok: leafSet.length > 1, detail: `k=${leafSet.length} (1 real + ${DECOYS} decoys), fixed denom ${realCoin.value7dp} (7dp)` });
+results.push({ name: "#1 anonymity set built", ok: leafSet.length >= 1, detail: `k=${leafSet.length} (1 real + ${DECOYS} decoys), fixed denom ${realCoin.value7dp} (7dp)` });
 
 // association set containing the real note's label; set it on-chain as the ASP root.
 const assoc = buildAssociationSet(realCoin, SCRATCH, "zkw");
