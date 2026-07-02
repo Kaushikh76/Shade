@@ -55,9 +55,13 @@ template DepositNoteMint() {
     signal output commitment;
 
     // Recompute the commitment from the opening (formula matches coinutils +
-    // the withdraw/transfer circuits: Poseidon(value,label,Poseidon(nullifier,secret))).
+    // the withdraw/transfer circuits: Poseidon(value, Poseidon(assetId,label),
+    // Poseidon(nullifier,secret))). The note's asset is bound to assetIdHash — the
+    // same value the contract checks against the real CCTP message's asset — so a
+    // deposited note is permanently tied to the asset that funded it.
     component commitmentHasher = CommitmentHasher();
     commitmentHasher.value <== value;
+    commitmentHasher.assetId <== assetIdHash;
     commitmentHasher.label <== label;
     commitmentHasher.secret <== secret;
     commitmentHasher.nullifier <== nullifier;

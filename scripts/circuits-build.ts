@@ -31,11 +31,11 @@ const CIRCOM_BIN =
 
 // name -> nPublic (output signals + declared public inputs in component main)
 const CIRCUITS: { name: string; nPublic: number }[] = [
-  { name: "withdraw_public",   nPublic: 17 }, // 1 output + 16 public inputs
-  { name: "private_transfer",  nPublic: 7  }, // #2 hidden-amount transfer + P2 #14 ASP binding
-  { name: "deposit_note_mint", nPublic: 14 }, // 1 output + 13 inputs
+  { name: "withdraw_public",   nPublic: 18 }, // 1 output + 17 public inputs (+assetId, multi-asset)
+  { name: "private_transfer",  nPublic: 8  }, // #2 hidden-amount transfer + P2 #14 ASP + assetId
+  { name: "deposit_note_mint", nPublic: 14 }, // 1 output + 13 inputs (assetIdHash already public, now bound into commitment)
   { name: "proof_of_fill_claim", nPublic: 11 }, // 1 output (claimId) + 10 public inputs
-  { name: "mpc_settlement",    nPublic: 11 }, // 4 outputs + 7 public inputs
+  { name: "mpc_settlement",    nPublic: 14 }, // 4 outputs + 10 public inputs (+assetIdA, assetIdB, rate)
 ];
 
 const checks: CheckResult[] = [];

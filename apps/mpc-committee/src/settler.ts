@@ -11,6 +11,8 @@ type MatchRow = {
   matchedAmount7dp: string;
   inputAsset: string;
   outputAsset: string;
+  // multi-asset: price of 1 unit of inputAsset in outputAsset (RATE_SCALE-scaled).
+  rate: string;
 };
 
 type BatchRow = {
@@ -105,6 +107,7 @@ async function queueSettlementJobs(queue: JobQueue, pool: pg.Pool, batch: BatchR
         matchedAmount7dp: m.matchedAmount7dp,
         inputAsset: m.inputAsset,
         outputAsset: m.outputAsset,
+        rate: m.rate,
         // Note data for on-chain settlement call
         nullifierA: noteA?.note_nullifier ?? null,
         nullifierB: noteB?.note_nullifier ?? null,

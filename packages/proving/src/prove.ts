@@ -24,17 +24,35 @@ export type GeneratedCoin = {
   commitmentHex: string;
   commitmentDecimal: string;
   value7dp: string;
+  // multi-asset: decimal field element bound into the commitment
+  // (= int(sha256(asset_strkey)[:31])), matching the contract's
+  // recipient_hash(asset_sac). "0" for legacy/unbound coins.
+  assetId: string;
 };
 
-export function generateCoin(scope: string, outPath: string): GeneratedCoin {
-  execFileSync(COINUTILS, ["generate", scope, "-o", outPath], { encoding: "utf8" });
+// multi-asset: `value7dp`/`assetId`, when provided, are passed to coinutils'
+// `--value`/`--asset-id` so the generated note is bound to a real denomination
+// and asset instead of the legacy fixed COIN_VALUE/unbound (assetId="0").
+export function generateCoin(scope: string, outPath: string, value7dp?: string, assetId?: string): GeneratedCoin {
+  const args = ["generate", scope, "-o", outPath];
+  if (value7dp) args.push("--value", value7dp);
+  if (assetId) args.push("--asset-id", assetId);
+  execFileSync(COINUTILS, args, { encoding: "utf8" });
   const coin = JSON.parse(readFileSync(outPath, "utf8"));
   return {
     path: outPath,
     commitmentHex: coin.commitment_hex,
     commitmentDecimal: coin.coin.commitment,
-    value7dp: coin.coin.value
+    value7dp: coin.coin.value,
+    assetId: coin.coin.asset_id ?? "0"
   };
+}
+
+// multi-asset: the field-element hash the contract/circuits use to identify an
+// asset (int(sha256(asset_strkey)[:31])). Matches recipientHashField below but
+// exported under an asset-specific name for call-site clarity.
+export function assetIdField(assetStrkey: string): string {
+  return recipientHashField(assetStrkey);
 }
 
 // #4 Build a real ASP association set containing this coin's label and return

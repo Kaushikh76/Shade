@@ -38,6 +38,7 @@ template PrivateTransfer(treeDepth, associationDepth) {
     signal input associationRoot;   // [4]
     signal input poolId;            // [5]
     signal input chainId;           // [6]
+    signal input assetId;           // [7] asset bound into both note commitments (transfer preserves asset)
 
     // PRIVATE — input note
     signal input inValue;
@@ -61,6 +62,7 @@ template PrivateTransfer(treeDepth, associationDepth) {
     // 1) input commitment membership in the state tree
     component inHasher = CommitmentHasher();
     inHasher.value <== inValue;
+    inHasher.assetId <== assetId;
     inHasher.label <== inLabel;
     inHasher.nullifier <== inNullifier;
     inHasher.secret <== inSecret;
@@ -82,6 +84,7 @@ template PrivateTransfer(treeDepth, associationDepth) {
     // 3) output commitment is correctly formed and matches the public signal
     component outHasher = CommitmentHasher();
     outHasher.value <== outValue;
+    outHasher.assetId <== assetId;
     outHasher.label <== outLabel;
     outHasher.nullifier <== outNullifier;
     outHasher.secret <== outSecret;
@@ -109,4 +112,4 @@ template PrivateTransfer(treeDepth, associationDepth) {
     associationRoot === associationRootChecker.out;
 }
 
-component main {public [outputCommitment, feePublic, stateRoot, associationRoot, poolId, chainId]} = PrivateTransfer(12, 2);
+component main {public [outputCommitment, feePublic, stateRoot, associationRoot, poolId, chainId, assetId]} = PrivateTransfer(12, 2);

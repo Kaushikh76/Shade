@@ -1,7 +1,7 @@
 import { v4 as uuidv4 } from "uuid";
 import {
   reconstructAmount, computeBatchHash,
-  type SignedMatchBatch, type NodeSignature
+  type SignedMatchBatch, type NodeSignature, type RateProvider
 } from "@shade/mpc-crypto";
 import type { SessionState } from "./state.js";
 import { matchIntents, type CoordinatorResult } from "./coordinator.js";
@@ -48,7 +48,8 @@ function threshold(n: number): number {
 export async function runMatchingRoundRemote(
   session: SessionState,
   nodeEndpoints: NodeEndpoint[],
-  internalToken: string
+  internalToken: string,
+  rateProvider: RateProvider
 ): Promise<CoordinatorResult> {
   if (session.intents.size < 2) {
     return { ok: false, reason: "need at least 2 intents to match" };
@@ -106,7 +107,7 @@ export async function runMatchingRoundRemote(
   }
 
   // Step 3: matching.
-  const matches = matchIntents(reconstructed);
+  const matches = await matchIntents(reconstructed, rateProvider);
 
   // Step 4: ask every node to sign — again best-effort, threshold-gated.
   const batchId = uuidv4();

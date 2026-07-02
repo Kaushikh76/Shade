@@ -99,7 +99,7 @@ async function computeMpcRoot(
 
 function coinFromPath(path: string): GeneratedCoin {
   const c = JSON.parse(readFileSync(path, "utf8"));
-  return { path, commitmentHex: c.commitment_hex, commitmentDecimal: c.coin.commitment, value7dp: c.coin.value };
+  return { path, commitmentHex: c.commitment_hex, commitmentDecimal: c.coin.commitment, value7dp: c.coin.value, assetId: c.coin.asset_id ?? "0" };
 }
 
 const RPC = process.env.STELLAR_RPC_URL ?? "https://soroban-testnet.stellar.org";
@@ -229,7 +229,8 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
         batchMatches = arr.map((m: Record<string, string>) => ({
           intentAId: m.intentAId, intentBId: m.intentBId,
           matchedAmount7dp: m.matchedAmount7dp,
-          inputAsset: m.inputAsset, outputAsset: m.outputAsset
+          inputAsset: m.inputAsset, outputAsset: m.outputAsset,
+          rate: m.rate ?? "100000000000000" // 1e14 = 1:1, legacy batches predating rate-awareness
         }));
       }
     } catch { /* DB unavailable — fall back to payload match */ }
@@ -239,7 +240,8 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
       batchMatches = [{
         intentAId: String(p.intentAId), intentBId: String(p.intentBId),
         matchedAmount7dp: String(p.matchedAmount7dp),
-        inputAsset: String(p.inputAsset), outputAsset: String(p.outputAsset)
+        inputAsset: String(p.inputAsset), outputAsset: String(p.outputAsset),
+        rate: String(p.rate ?? "100000000000000")
       }];
     }
 
@@ -297,8 +299,13 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
 
         const coinFile = (path: string) => {
           const raw = JSON.parse(readFileSync(path, "utf8"));
-          return { path, commitmentHex: raw.commitment_hex as string, commitmentDecimal: raw.coin.commitment as string, value7dp: raw.coin.value as string };
+          return {
+            path, commitmentHex: raw.commitment_hex as string, commitmentDecimal: raw.coin.commitment as string,
+            value7dp: raw.coin.value as string, assetId: (raw.coin.asset_id as string) ?? "0"
+          };
         };
+        const fileA = coinFile(coinAPath);
+        const fileB = coinFile(coinBPath);
 
         // Fetch pool commitments for Merkle proof generation.
         let commitmentsDecimal: string[] = [];
@@ -311,9 +318,15 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
           );
         } catch { /* DB unavailable */ }
 
+        // multi-asset: assetIdA/assetIdB come from the coins themselves (each
+        // note is Merkle-bound to one asset — see commitment.circom). `rate`
+        // (price of assetIdA in assetIdB, scaled 1e14) is computed by the
+        // matcher (see coordinator.ts) and threaded through the job payload;
+        // default to 1e14 (1:1) only for a same-asset match, matching prior
+        // behavior before rate-awareness existed.
         const proof = buildMpcSettlementProof({
-          coinA: coinFile(coinAPath),
-          coinB: coinFile(coinBPath),
+          coinA: fileA,
+          coinB: fileB,
           commitmentsDecimal,
           assocPath,
           scope: String(p.scope ?? env.POOL_SCOPE ?? "shade-pool-testnet-v1"),
@@ -322,6 +335,9 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
           chainId: String(p.chainId ?? "27"), // Stellar CCTP domain
           matchedAmount7dp: String(p.matchedAmount7dp),
           deadlineLedger: String(p.deadlineLedger ?? "0"),
+          assetIdA: fileA.assetId,
+          assetIdB: fileB.assetId,
+          rate: String(p.rate ?? "100000000000000"),
           scratch,
           tag
         });
@@ -376,6 +392,9 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
     const sigsJson    = JSON.stringify(sigs.map(s => stripHex(s.signature)));
 
     // Pass proof_bytes / pub_signals_bytes as Some(hex) or null (Option<Bytes>).
+    // stellar-cli 27.x parses Option<Bytes> args as JSON (unlike plain Bytes/
+    // BytesN, which take raw hex) — the hex must be JSON.stringify'd into a
+    // quoted string, or the CLI's JSON parser rejects it as "invalid number".
     const r = sorobanInvoke({
       contractId: pool, secret: relayerSecret,
       method: "mpc_settle", rpcUrl: RPC, passphrase: PASS, retries: 3,
@@ -388,8 +407,8 @@ export async function processRelayerJob(queue: JobQueue, job: ServiceJob): Promi
         "--batch_hash",          hash32,
         "--signer_pubkeys",      pubkeysJson,
         "--signatures",          sigsJson,
-        "--proof_bytes",         zkProofHex ?? "null",
-        "--pub_signals_bytes",   zkPublicHex ?? "null",
+        "--proof_bytes",         zkProofHex ? JSON.stringify(zkProofHex) : "null",
+        "--pub_signals_bytes",   zkPublicHex ? JSON.stringify(zkPublicHex) : "null",
       ]
     });
     return {

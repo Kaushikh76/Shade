@@ -12,6 +12,9 @@ import { runMatchingRound } from "./coordinator.js";
 import { runSettlerLoop } from "./settler.js";
 import { loadOrGenerateKeys } from "./keys.js";
 import { persistSignedBatch } from "./persist.js";
+import { getRateProvider } from "./reflector-rate.js";
+
+const rateProvider = getRateProvider();
 
 // DEV/DEMO MODE ONLY: three committee nodes + the coordinator run in this one
 // process, so one process holds all three secret keys simultaneously — no
@@ -146,7 +149,7 @@ async function startCoordinator() {
       if (session.status !== "open") {
         return { ok: false, reason: `session already in status '${session.status}'` };
       }
-      const result = await runMatchingRound(session, nodes);
+      const result = await runMatchingRound(session, nodes, rateProvider);
       if (result.ok && dbPool) {
         await persistSignedBatch(dbPool, session.sessionId, result.batch);
       }
@@ -196,7 +199,7 @@ function startBatchTimer() {
     for (const session of open) {
       if (session.intents.size < 2) continue;
       console.log(`[mpc] auto-matching session ${session.sessionId} with ${session.intents.size} intents`);
-      const result = await runMatchingRound(session, nodes);
+      const result = await runMatchingRound(session, nodes, rateProvider);
       if (result.ok) {
         if (dbPool) await persistSignedBatch(dbPool, session.sessionId, result.batch);
         console.log(`[mpc] batch ${result.batch.batchId}: ${result.batch.matches.length} matches, signed by ${result.batch.signatures.length} nodes`);

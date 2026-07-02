@@ -109,7 +109,13 @@ export function computeBatchHash(batchId: string, matches: MatchResult[]): strin
   const canonical = JSON.stringify({
     batchId,
     matches: matches
-      .map(m => ({ a: m.intentAId, b: m.intentBId, amt: m.matchedAmount7dp, in: m.inputAsset, out: m.outputAsset }))
+      // multi-asset: `rate` is included so the committee signs the actual
+      // exchange rate used for this match — without it, a relayer could
+      // submit a validly-signed batch/matches but pair it with a different
+      // rate at proof-build time (the ZK proof would still need to satisfy
+      // the pool's Reflector deviation check, but the *signed* batch would
+      // no longer be evidence of what rate the committee actually agreed to).
+      .map(m => ({ a: m.intentAId, b: m.intentBId, amt: m.matchedAmount7dp, in: m.inputAsset, out: m.outputAsset, rate: m.rate }))
       // Total order, tie-broken down to `b`: a comparator that never returns 0
       // is not a valid total order and can sort ties differently across JS
       // engines/versions, producing a non-deterministic batchHash for the

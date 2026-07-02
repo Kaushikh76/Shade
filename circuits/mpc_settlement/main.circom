@@ -3,61 +3,72 @@ pragma circom 2.2.0;
 include "poseidon255.circom";
 include "commitment.circom";
 include "merkleProof.circom";
+include "bitify.circom";
+include "comparators.circom";
 
-// Shade MpcSettlement circuit.
+// Shade MpcSettlement circuit — MULTI-ASSET, RATE-AWARE.
 //
 // Proves that a two-party MPC committee match is consistent with real deposited
 // notes — without revealing the notes' private preimages. The circuit jointly
 // proves BOTH sides of a matched pair so the contract can atomically spend both
 // nullifiers in a single `mpc_settle` call.
 //
-// Hash-function architecture (no mismatch):
-//   - Committee batch hash: SHA-256 over a canonical JSON string (TypeScript code).
-//     This is passed as a PUBLIC input `batchHash`. The contract verifies the
-//     committee threshold Ed25519 signature over this hash independently.
-//   - In-circuit hashes: all Poseidon255 (commitment, nullifier, Merkle proofs,
-//     compliance tree). These NEVER need to match the SHA-256 batch hash.
-//   - Link: both the contract (committee sig check) and this circuit (proof)
-//     expose `batchHash` as a shared public signal. If they differ the contract
-//     rejects. This binds the proof to the committee-approved batch without
-//     requiring a SHA-256 gadget inside the circuit.
+// CROSS-ASSET SETTLEMENT (fixes the prior 1:1 / single-asset assumption):
+//   - Note A (spent by party A) holds asset `assetIdA`, note B holds `assetIdB`.
+//     assetId is bound into each note's commitment (CommitmentHasher), so a note
+//     is cryptographically tied to one asset — settlement can no longer assume
+//     USDC.
+//   - A crossing trade: A gives `matchedAmount7dp` of assetIdA and receives
+//     assetIdB; B gives assetIdB and receives assetIdA.
+//   - `rate` = price of 1 unit of assetIdA denominated in assetIdB, scaled by
+//     RATE_SCALE = 1e14 (Reflector SEP-40 price convention). The contract
+//     validates `rate` against the on-chain Reflector oracle (staleness +
+//     deviation guard); this circuit enforces that the output amounts are
+//     exactly consistent with that rate.
+//   - Output notes (a cross-swap; NO token leaves the pool — ownership of
+//     shielded notes changes):
+//       outputCommitmentA (owned by B) = asset assetIdA, value matchedAmount7dp
+//       outputCommitmentB (owned by A) = asset assetIdB, value
+//         floor(matchedAmount7dp * rate / RATE_SCALE)
 //
-// What the circuit proves:
-//   1. Input note A and note B are genuine commitments in the current Merkle tree.
-//   2. Both labels satisfy the protocol's ASP compliance policy.
-//   3. Domain-separated nullifier hashes are correctly formed.
-//   4. Output commitments are well-formed from supplied preimages.
-//   5. Matched amount satisfies both trades (matchedAmount ≤ min(valueA, valueB)).
-//   6. Value is conserved: outValueA + outValueB == 2 × matchedAmount.
+// Hash-function architecture:
+//   - Committee batch hash: SHA-256 over canonical JSON (TypeScript). Passed as
+//     the PUBLIC input `batchHash`; the contract verifies the committee
+//     threshold Ed25519 signature over it independently and checks it equals
+//     this proof's batchHash.
+//   - In-circuit hashes: all Poseidon255 (commitment, nullifier, Merkle).
 //
 // Public-signal order (outputs first, then declared `public` inputs):
 //   [0]  nullifierHashA     domain-sep nullifier for note A (spent on-chain)
 //   [1]  nullifierHashB     domain-sep nullifier for note B (spent on-chain)
-//   [2]  outputCommitmentA  new note commitment (counterparty B will own this)
-//   [3]  outputCommitmentB  new note commitment (counterparty A will own this)
+//   [2]  outputCommitmentA  new note (counterparty B owns; asset assetIdA)
+//   [3]  outputCommitmentB  new note (counterparty A owns; asset assetIdB)
 //   [4]  stateRoot          Merkle root; both notes must be leaves
 //   [5]  associationRoot    ASP compliance root; both labels must be members
 //   [6]  batchHash          SHA-256 batch hash the committee signed (pass-through)
 //   [7]  poolId             domain separator
 //   [8]  chainId            domain separator
-//   [9]  matchedAmount7dp   amount of the trade (7dp)
+//   [9]  matchedAmount7dp   amount of assetIdA traded (7dp)
 //   [10] deadlineLedger     later of the two intent deadlines
+//   [11] assetIdA           asset of note A / output note A
+//   [12] assetIdB           asset of note B / output note B
+//   [13] rate               price(assetIdA in assetIdB) * 1e14 (Reflector-scaled)
 
 template MpcSettlement(treeDepth, associationDepth) {
 
     // ── PUBLIC INPUTS ────────────────────────────────────────────────────────
     signal input stateRoot;
     signal input associationRoot;
-    // batchHash: the SHA-256 batch hash from `computeBatchHash()` in mpc-crypto.
-    // The contract verifies the committee threshold sig over this value and checks
-    // that this proof's batchHash == the one that was signed.
     signal input batchHash;
     signal input poolId;
     signal input chainId;
     signal input matchedAmount7dp;
     signal input deadlineLedger;
+    signal input assetIdA;
+    signal input assetIdB;
+    signal input rate;
 
-    // ── PRIVATE INPUTS — NOTE A (the note being spent by party A) ───────────
+    // ── PRIVATE INPUTS — NOTE A (spent by party A; asset assetIdA) ───────────
     signal input labelA;
     signal input valueA;
     signal input nullifierA;
@@ -67,13 +78,14 @@ template MpcSettlement(treeDepth, associationDepth) {
     signal input labelIndexA;
     signal input labelSiblingsA[associationDepth];
 
-    // ── PRIVATE INPUTS — OUTPUT NOTE A (new note; counterparty B will own it)─
-    signal input outValueA;
+    // ── PRIVATE INPUTS — OUTPUT NOTE A (counterparty B owns; asset assetIdA) ─
+    // value is fixed to matchedAmount7dp (see below), so only the blinding
+    // fields are supplied here.
     signal input outLabelA;
     signal input outNullifierA;
     signal input outSecretA;
 
-    // ── PRIVATE INPUTS — NOTE B (the note being spent by party B) ───────────
+    // ── PRIVATE INPUTS — NOTE B (spent by party B; asset assetIdB) ───────────
     signal input labelB;
     signal input valueB;
     signal input nullifierB;
@@ -83,7 +95,9 @@ template MpcSettlement(treeDepth, associationDepth) {
     signal input labelIndexB;
     signal input labelSiblingsB[associationDepth];
 
-    // ── PRIVATE INPUTS — OUTPUT NOTE B (new note; counterparty A will own it)─
+    // ── PRIVATE INPUTS — OUTPUT NOTE B (counterparty A owns; asset assetIdB) ─
+    // outValueB = floor(matchedAmount7dp * rate / RATE_SCALE); prover supplies it
+    // and the value is verified by the division gadget below.
     signal input outValueB;
     signal input outLabelB;
     signal input outNullifierB;
@@ -95,22 +109,22 @@ template MpcSettlement(treeDepth, associationDepth) {
     signal output outputCommitmentA;    // [2]
     signal output outputCommitmentB;    // [3]
 
-    // ── 1. Compute input commitments ─────────────────────────────────────────
+    // ── 1. Input commitments (asset-bound) ───────────────────────────────────
     component cmtA = CommitmentHasher();
-    cmtA.label     <== labelA;
     cmtA.value     <== valueA;
+    cmtA.assetId   <== assetIdA;
+    cmtA.label     <== labelA;
     cmtA.secret    <== secretA;
     cmtA.nullifier <== nullifierA;
-    signal commitmentA   <== cmtA.commitment;
-    signal _inNhA        <== cmtA.nullifierHash; // unused output consumed
+    signal commitmentA <== cmtA.commitment;
 
     component cmtB = CommitmentHasher();
-    cmtB.label     <== labelB;
     cmtB.value     <== valueB;
+    cmtB.assetId   <== assetIdB;
+    cmtB.label     <== labelB;
     cmtB.secret    <== secretB;
     cmtB.nullifier <== nullifierB;
-    signal commitmentB   <== cmtB.commitment;
-    signal _inNhB        <== cmtB.nullifierHash;
+    signal commitmentB <== cmtB.commitment;
 
     // ── 2. Merkle membership: both notes in state tree ───────────────────────
     component merkleA = MerkleProof(treeDepth);
@@ -151,49 +165,65 @@ template MpcSettlement(treeDepth, associationDepth) {
     nhB.in[2] <== chainId;
     nullifierHashB <== nhB.out;
 
-    // ── 5. Output commitments ────────────────────────────────────────────────
+    // ── 5. Output commitments (cross-swap assets) ────────────────────────────
+    // Output A goes to party B and is in asset assetIdA, value matchedAmount7dp.
     component outCmtA = CommitmentHasher();
+    outCmtA.value     <== matchedAmount7dp;
+    outCmtA.assetId   <== assetIdA;
     outCmtA.label     <== outLabelA;
-    outCmtA.value     <== outValueA;
     outCmtA.secret    <== outSecretA;
     outCmtA.nullifier <== outNullifierA;
     outputCommitmentA <== outCmtA.commitment;
-    signal _outNhA    <== outCmtA.nullifierHash;
 
+    // Output B goes to party A and is in asset assetIdB, value outValueB.
     component outCmtB = CommitmentHasher();
-    outCmtB.label     <== outLabelB;
     outCmtB.value     <== outValueB;
+    outCmtB.assetId   <== assetIdB;
+    outCmtB.label     <== outLabelB;
     outCmtB.secret    <== outSecretB;
     outCmtB.nullifier <== outNullifierB;
     outputCommitmentB <== outCmtB.commitment;
-    signal _outNhB    <== outCmtB.nullifierHash;
 
-    // ── 6. Match value constraints ───────────────────────────────────────────
-    // matchedAmount ≤ valueA (difference is non-negative, 128-bit).
+    // ── 6. Solvency: each party must own enough of the asset they send ───────
+    // A sends matchedAmount7dp of assetIdA: matchedAmount7dp <= valueA.
     signal remainA <== valueA - matchedAmount7dp;
     component rngA = Num2Bits(128);
     rngA.in <== remainA;
     _ <== rngA.out;
 
-    // matchedAmount ≤ valueB
-    signal remainB <== valueB - matchedAmount7dp;
+    // B sends outValueB of assetIdB: outValueB <= valueB.
+    signal remainB <== valueB - outValueB;
     component rngB = Num2Bits(128);
     rngB.in <== remainB;
     _ <== rngB.out;
 
-    // Value conservation: each party sends matchedAmount to the other.
-    signal outSum      <== outValueA + outValueB;
-    signal expectedSum <== matchedAmount7dp * 2;
-    outSum === expectedSum;
+    // ── 7. Rate correctness: outValueB == floor(matchedAmount7dp * rate / 1e14)
+    // Enforced as: matchedAmount7dp * rate == outValueB * RATE_SCALE + remainder,
+    // with 0 <= remainder < RATE_SCALE. This uniquely pins outValueB to the
+    // Reflector-scaled price the contract independently validates against the
+    // oracle. RATE_SCALE = 1e14 (< 2^47); products stay well under the field.
+    var RATE_SCALE = 100000000000000;
+    signal prod <== matchedAmount7dp * rate;
+    signal remainder <== prod - outValueB * RATE_SCALE;
+    // remainder >= 0 (fits in 64 bits) — a too-large outValueB makes this negative
+    // (wraps to a huge field element) and fails the range check.
+    component remRange = Num2Bits(64);
+    remRange.in <== remainder;
+    _ <== remRange.out;
+    // remainder < RATE_SCALE
+    component remLt = LessThan(64);
+    remLt.in[0] <== remainder;
+    remLt.in[1] <== RATE_SCALE;
+    remLt.out === 1;
 
-    // ── 7. Bind public inputs into constraint system ─────────────────────────
+    // ── 8. Bind remaining public inputs into the constraint system ───────────
     // batchHash is a pass-through public signal (SHA-256, not recomputed here).
-    // The contract checks: committee_sig_verified_over(batchHash) AND proof.batchHash == batchHash.
-    signal bhBind      <== batchHash * batchHash;
-    signal dlBind      <== deadlineLedger * deadlineLedger;
+    signal bhBind <== batchHash * batchHash;
+    signal dlBind <== deadlineLedger * deadlineLedger;
 }
 
 component main {public [
     stateRoot, associationRoot, batchHash,
-    poolId, chainId, matchedAmount7dp, deadlineLedger
+    poolId, chainId, matchedAmount7dp, deadlineLedger,
+    assetIdA, assetIdB, rate
 ]} = MpcSettlement(12, 2);

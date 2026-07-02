@@ -44,6 +44,7 @@ template Withdraw(treeDepth, associationDepth) {
     signal input destinationRecipient;  // P1.7 CCTP: int(recipient32); contract binds arg
     signal input maxFee;                // P1.7 CCTP: max fee; contract binds arg
     signal input minFinalityThreshold;  // P1.7 CCTP: min finality threshold; contract binds arg
+    signal input assetId;               // [17] asset bound into the note commitment; contract binds arg to the SAC being released
 
     // PRIVATE SIGNALS
     signal input label;                 // hash(scope, nonce)
@@ -64,6 +65,7 @@ template Withdraw(treeDepth, associationDepth) {
     component commitmentHasher = CommitmentHasher();
     commitmentHasher.label <== label;
     commitmentHasher.value <== value;
+    commitmentHasher.assetId <== assetId;
     commitmentHasher.secret <== secret;
     commitmentHasher.nullifier <== nullifier;
     signal commitment <== commitmentHasher.commitment;
@@ -130,4 +132,4 @@ template Withdraw(treeDepth, associationDepth) {
     signal ftBind <== minFinalityThreshold * minFinalityThreshold;
 }
 
-component main {public [operationType, withdrawnValue, recipientHash, relayerFee, deadlineLedger, stateRoot, associationRoot, poolId, chainId, quoteHash, intentHash, fillReceiptHash, destinationDomain, destinationRecipient, maxFee, minFinalityThreshold]} = Withdraw(12, 2);
+component main {public [operationType, withdrawnValue, recipientHash, relayerFee, deadlineLedger, stateRoot, associationRoot, poolId, chainId, quoteHash, intentHash, fillReceiptHash, destinationDomain, destinationRecipient, maxFee, minFinalityThreshold, assetId]} = Withdraw(12, 2);

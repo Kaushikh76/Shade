@@ -52,7 +52,17 @@ export type MpcSettlementParams = {
   deadlineLedger: string;
   scratch: string;
   tag: string;
+  // multi-asset: assetId of note A / note B (decimal field elements; = the
+  // coins' own `.assetId`, matching the contract's recipient_hash(sac)).
+  assetIdA: string;
+  assetIdB: string;
+  // multi-asset: price of 1 unit of assetIdA denominated in assetIdB, scaled
+  // by RATE_SCALE (1e14, Reflector's decimals() convention). outValueB is
+  // derived from this rate, not hardcoded to matchedAmount7dp.
+  rate: string;
 };
+
+const RATE_SCALE = 100000000000000n; // 1e14, matches circuits/mpc_settlement/main.circom
 
 export type MpcSettlementProof = {
   proofHex: string;
@@ -73,6 +83,8 @@ export type NotePreimage = {
   label: string;
   nullifier: string;
   secret: string;
+  // multi-asset: asset the output note is bound to (decimal field element).
+  assetId: string;
 };
 
 const BN254_P = 21888242871839275222246405745257275088548364400416034343698204186575808495617n;
@@ -95,8 +107,8 @@ function hexOut(decimal: string): string {
 
 function readCoinPreimage(coin: GeneratedCoin): NotePreimage {
   const raw = JSON.parse(readFileSync(coin.path, "utf8"));
-  const c = raw.coin as { value: string; label: string; nullifier: string; secret: string };
-  return { value: c.value, label: c.label, nullifier: c.nullifier, secret: c.secret };
+  const c = raw.coin as { value: string; label: string; nullifier: string; secret: string; asset_id?: string };
+  return { value: c.value, label: c.label, nullifier: c.nullifier, secret: c.secret, assetId: c.asset_id ?? "0" };
 }
 
 // Build the mpc_settlement circuit witness input JSON from two coin files.
@@ -147,16 +159,26 @@ export function buildMpcSettlementWitness(p: MpcSettlementParams): {
   const preA = readCoinPreimage(p.coinA);
   const preB = readCoinPreimage(p.coinB);
 
-  // Fresh output notes. Each party receives exactly matchedAmount7dp.
-  // outValueA + outValueB == 2 * matchedAmount7dp (value conservation in circuit).
+  // Cross-asset swap: A sends matchedAmount7dp of assetIdA and receives
+  // assetIdB; B sends the rate-derived amount of assetIdB and receives
+  // assetIdA. outValueB = floor(matchedAmount7dp * rate / RATE_SCALE), matching
+  // the circuit's step-7 rate-correctness constraint exactly (integer division,
+  // same rounding direction) so the witness satisfies the circuit's remainder
+  // range check.
+  const outValueB = (BigInt(p.matchedAmount7dp) * BigInt(p.rate)) / RATE_SCALE;
+
+  // Output A goes to party B, asset assetIdA, value matchedAmount7dp.
   const outPreimageA: NotePreimage = {
     value: p.matchedAmount7dp,
+    assetId: p.assetIdA,
     label: randField(),
     nullifier: randField(),
     secret: randField()
   };
+  // Output B goes to party A, asset assetIdB, value outValueB (rate-derived).
   const outPreimageB: NotePreimage = {
-    value: p.matchedAmount7dp,
+    value: outValueB.toString(),
+    assetId: p.assetIdB,
     label: randField(),
     nullifier: randField(),
     secret: randField()
@@ -174,6 +196,9 @@ export function buildMpcSettlementWitness(p: MpcSettlementParams): {
     chainId:          p.chainId,
     matchedAmount7dp: p.matchedAmount7dp,
     deadlineLedger:   p.deadlineLedger,
+    assetIdA:         p.assetIdA,
+    assetIdB:         p.assetIdB,
+    rate:             p.rate,
 
     // Input note A
     labelA:          preA.label,
@@ -185,8 +210,8 @@ export function buildMpcSettlementWitness(p: MpcSettlementParams): {
     labelIndexA:     wA.labelIndex,
     labelSiblingsA:  wA.labelSiblings,
 
-    // Output note A (goes to party B)
-    outValueA:    outPreimageA.value,
+    // Output note A (goes to party B). No outValueA signal — the circuit
+    // hardcodes output A's value to matchedAmount7dp (see main.circom step 5).
     outLabelA:    outPreimageA.label,
     outNullifierA: outPreimageA.nullifier,
     outSecretA:   outPreimageA.secret,
@@ -217,13 +242,14 @@ export function buildMpcSettlementWitness(p: MpcSettlementParams): {
 // If they are absent, throws MpcCircuitNotBuiltError — callers catch this and fall
 // back to committee-signature-only settlement (still valid on testnet).
 //
-// Public signal layout (matches main.circom component declaration):
+// Public signal layout (matches main.circom component declaration, multi-asset):
 //   [0] nullifierHashA   [1] nullifierHashB
 //   [2] outputCommitmentA [3] outputCommitmentB
 //   [4] stateRoot         [5] associationRoot
 //   [6] batchHash         [7] poolId
 //   [8] chainId           [9] matchedAmount7dp
-//   [10] deadlineLedger
+//   [10] deadlineLedger   [11] assetIdA
+//   [12] assetIdB         [13] rate
 export function buildMpcSettlementProof(p: MpcSettlementParams): MpcSettlementProof {
   if (!hasMpcSettlementArtifacts()) throw new MpcCircuitNotBuiltError();
 

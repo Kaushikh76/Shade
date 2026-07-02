@@ -6,6 +6,9 @@ import { CommitteeState } from "./state.js";
 import { runMatchingRoundRemote, type NodeEndpoint } from "./remote-coordinator.js";
 import { runSettlerLoop } from "./settler.js";
 import { persistSignedBatch } from "./persist.js";
+import { getRateProvider } from "./reflector-rate.js";
+
+const rateProvider = getRateProvider();
 
 // P4 #24: standalone coordinator — pairs with node-server.ts. Holds NO node
 // secret keys (unlike server.ts's combined dev/demo mode); every node
@@ -99,7 +102,7 @@ app.post<{ Params: { sessionId: string } }>("/v1/mpc/sessions/:sessionId/match",
   const session = state.getSession(request.params.sessionId);
   if (!session) { reply.code(404); return { error: "session not found" }; }
   if (session.status !== "open") return { ok: false, reason: `session already in status '${session.status}'` };
-  const result = await runMatchingRoundRemote(session, NODE_ENDPOINTS, INTERNAL_TOKEN);
+  const result = await runMatchingRoundRemote(session, NODE_ENDPOINTS, INTERNAL_TOKEN, rateProvider);
   if (result.ok && dbPool) await persistSignedBatch(dbPool, session.sessionId, result.batch);
   return result.ok ? { ok: true, batch: result.batch } : { ok: false, reason: result.reason };
 });
@@ -125,7 +128,7 @@ setInterval(async () => {
   for (const session of state.getOpenSessions()) {
     if (session.intents.size < 2) continue;
     console.log(`[mpc-coordinator] auto-matching session ${session.sessionId} with ${session.intents.size} intents`);
-    const result = await runMatchingRoundRemote(session, NODE_ENDPOINTS, INTERNAL_TOKEN);
+    const result = await runMatchingRoundRemote(session, NODE_ENDPOINTS, INTERNAL_TOKEN, rateProvider);
     if (result.ok) {
       if (dbPool) await persistSignedBatch(dbPool, session.sessionId, result.batch);
       console.log(`[mpc-coordinator] batch ${result.batch.batchId}: ${result.batch.matches.length} matches, signed by ${result.batch.signatures.length}/${NODE_ENDPOINTS.length} nodes`);

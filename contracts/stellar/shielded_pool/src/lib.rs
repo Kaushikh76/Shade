@@ -89,6 +89,11 @@ pub enum Error {
     MpcProofInvalid = 26,   // Phase C: mpc_settlement ZK proof failed verification
     MpcSignalMismatch = 27, // Phase C: proof public signal != provided argument
     MpcDuplicateSigner = 28,// Phase 8: the same committee pubkey appears more than once in signer_pubkeys
+    UnknownAsset = 29,      // multi-asset: assetId signal has no registered SAC (call register_asset first)
+    CctpAssetMustBeUsdc = 30, // multi-asset: withdraw_cctp only supports USDC (Stellar CCTP outbound is USDC-only)
+    ReflectorNotConfigured = 31, // multi-asset: cross-asset mpc_settle needs set_reflector_oracle() first
+    RateStale = 32,         // multi-asset: Reflector price feed older than the staleness window
+    RateDeviation = 33,     // multi-asset: proof-bound rate deviates from the oracle rate beyond tolerance
 }
 
 const ADMIN: Symbol = symbol_short!("admin");
@@ -104,12 +109,50 @@ const XVERIFIER: Symbol = symbol_short!("xverifier"); // #2 PrivateTransfer veri
 const DEPVERIFIER: Symbol = symbol_short!("depverif"); // P1.8 DepositNoteMint verifier (separate circuit/vk)
 const MPC_CMTE: Symbol = symbol_short!("mpc_cmte");   // Phase 8: Vec<BytesN<32>> committee ed25519 pubkeys
 const MPC_VERIFIER: Symbol = symbol_short!("mpc_verif"); // Phase C: mpc_settlement Groth16 verifier contract
+const REFLECTOR: Symbol = symbol_short!("reflect");   // multi-asset: Reflector SEP-40 oracle contract address
+
+// multi-asset: price scale used by both this contract and the mpc_settlement
+// circuit's `rate` public signal, matching Reflector's conventional decimals().
+const RATE_SCALE: i128 = 100_000_000_000_000; // 1e14
+// multi-asset: max age (ledger seconds) a Reflector lastprice() may be before
+// mpc_settle refuses to use it. Reflector's crypto feed resolution is commonly
+// 5 minutes (300s); 3x that tolerates one missed round without opening a wide
+// stale-price window.
+const RATE_STALENESS_SECS: u64 = 900;
+// multi-asset: max allowed relative deviation between the proof-bound `rate`
+// and the on-chain Reflector rate, in basis points (100 = 1%).
+const RATE_DEVIATION_BPS: i128 = 100;
 
 #[contracttype]
 enum DataKey {
     KnownRoot(BytesN<32>),
     Deposit(BytesN<32>),
-    Solver(BytesN<32>), // C4: authorized solver ed25519 pubkey -> allowed
+    Solver(BytesN<32>),   // C4: authorized solver ed25519 pubkey -> allowed
+    AssetSac(BytesN<32>), // multi-asset: assetIdHash (= recipient_hash(sac)) -> SAC Address
+    // multi-asset: assetIdHash -> Reflector "Other(Symbol)" ticker (e.g. "XLM",
+    // "USDC"). Reflector's live testnet CEX/DEX feed prices assets by symbol,
+    // not by Stellar contract address (a project's own test-issued SAC has no
+    // DEX liquidity to price directly) — see reflector_lastprice below.
+    AssetSymbol(BytesN<32>),
+}
+
+// Local mirror of the Reflector SEP-40 oracle contract's #[contracttype]s
+// (reflector-network/reflector-contract, oracle/src/types.rs). Soroban
+// cross-contract calls serialize structurally (variant name + field shape),
+// so a locally-defined type with an identical shape round-trips correctly
+// without vendoring Reflector's crate.
+#[contracttype]
+#[derive(Clone)]
+pub enum ReflectorAsset {
+    Stellar(Address),
+    Other(Symbol),
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct ReflectorPriceData {
+    pub price: i128,
+    pub timestamp: u64,
 }
 
 #[contract]
@@ -132,6 +175,11 @@ impl ShieldedPool {
         env.storage().instance().set(&VERIFIER, &verifier);
         env.storage().instance().set(&NULLREG, &nullifier_registry);
         env.storage().instance().set(&PAUSED, &false);
+        // multi-asset: USDC is always registered so existing single-asset notes
+        // (assetId unbound / assetId == usdc hash) resolve without an extra call.
+        let usdc_hash = Self::recipient_hash(&env, &usdc_sac);
+        env.storage().persistent().set(&DataKey::AssetSac(usdc_hash.clone()), &usdc_sac);
+        env.storage().persistent().set(&DataKey::AssetSymbol(usdc_hash), &Symbol::new(&env, "USDC"));
         // #3 domain separators bound into every spend proof.
         env.storage().instance().set(&POOLID, &pool_id);
         env.storage().instance().set(&CHAINID, &chain_id);
@@ -279,6 +327,10 @@ impl ShieldedPool {
         let relayer_fee: i128 = fr32_to_i128(&signals.get(4).unwrap());
         let deadline_ledger: i128 = fr32_to_i128(&signals.get(5).unwrap());
         let state_root: BytesN<32> = signals.get(6).unwrap();
+        // multi-asset: [17] assetId — Merkle-bound to the spent commitment (see
+        // circuits/withdraw_public/commitment.circom), so this is already the
+        // real asset of the note being spent; just resolve it to a SAC.
+        let asset_id: BytesN<32> = signals.get(17).unwrap();
 
         // P1.5 enforce operation type.
         if op_type != OP_WITHDRAW_PUBLIC {
@@ -322,14 +374,14 @@ impl ShieldedPool {
 
         // Release net (withdrawnValue - relayerFee) to the recipient; fee stays.
         let net = withdrawn_value - relayer_fee;
-        let usdc: Address = env.storage().instance().get(&USDC).unwrap();
-        let client = token::TokenClient::new(&env, &usdc);
+        let asset_sac = Self::lookup_asset_sac(&env, &asset_id);
+        let client = token::TokenClient::new(&env, &asset_sac);
         if client.balance(&env.current_contract_address()) < net {
             panic_err(&env, Error::InsufficientBalance);
         }
         client.transfer(&env.current_contract_address(), &to, &net);
 
-        env.events().publish((symbol_short!("withdraw"),), (to, nullifier_hash, net, relayer_fee));
+        env.events().publish((symbol_short!("withdraw"),), (to, nullifier_hash, net, relayer_fee, asset_sac));
     }
 
     /// Set the Stellar CCTP TokenMessengerMinter used for proof-bound outbound.
@@ -348,6 +400,111 @@ impl ShieldedPool {
     pub fn set_deposit_verifier(env: Env, verifier: Address) {
         Self::require_admin(&env);
         env.storage().instance().set(&DEPVERIFIER, &verifier);
+    }
+
+    /// multi-asset: register a SAC as a settleable asset, with the ticker
+    /// Reflector prices it under (e.g. "XLM", "USDC" — Reflector's live
+    /// CEX/DEX feed keys by `Asset::Other(Symbol)`, not by Stellar contract
+    /// address, since a project's own test-issued SAC has no DEX/CEX
+    /// liquidity to price directly). Keyed by recipient_hash(sac) — the same
+    /// field the withdraw/deposit/mpc_settlement circuits bind as
+    /// `assetId`/`assetIdHash` — so a note's in-circuit asset signal resolves
+    /// directly to both the SAC (for token transfers) and the Reflector
+    /// ticker (for rate validation). Admin-gated; call once per asset (e.g.
+    /// XLM SAC) before any note of that asset can be withdrawn or settled
+    /// through rfq_settle/mpc_settle.
+    pub fn register_asset(env: Env, sac: Address, reflector_symbol: Symbol) {
+        Self::require_admin(&env);
+        let hash = Self::recipient_hash(&env, &sac);
+        env.storage().persistent().set(&DataKey::AssetSac(hash.clone()), &sac);
+        env.storage().persistent().set(&DataKey::AssetSymbol(hash.clone()), &reflector_symbol);
+        env.events().publish((symbol_short!("asset"),), (hash, sac, reflector_symbol));
+    }
+
+    /// multi-asset: resolve a circuit `assetId`/`assetIdHash` signal to its
+    /// registered SAC address (None if never registered via register_asset).
+    pub fn get_asset_sac(env: Env, asset_id_hash: BytesN<32>) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::AssetSac(asset_id_hash))
+    }
+
+    /// multi-asset: set the Reflector SEP-40 oracle contract used to validate
+    /// the cross-asset `rate` in mpc_settle. Admin-gated. Required before any
+    /// mpc_settle between two DIFFERENT assets (same-asset settles don't need it).
+    pub fn set_reflector_oracle(env: Env, oracle: Address) {
+        Self::require_admin(&env);
+        env.storage().instance().set(&REFLECTOR, &oracle);
+    }
+
+    pub fn get_reflector_oracle(env: Env) -> Option<Address> {
+        env.storage().instance().get(&REFLECTOR)
+    }
+
+    /// multi-asset: look up a registered SAC by its circuit assetId hash, or
+    /// panic with UnknownAsset. Shared by withdraw/rfq_settle/mpc_settle.
+    fn lookup_asset_sac(env: &Env, asset_id_hash: &BytesN<32>) -> Address {
+        env.storage().persistent().get(&DataKey::AssetSac(asset_id_hash.clone()))
+            .unwrap_or_else(|| panic_err(env, Error::UnknownAsset))
+    }
+
+    /// multi-asset: resolve a registered asset's Reflector ticker, or panic
+    /// with UnknownAsset (register_asset must be called with a
+    /// reflector_symbol before that asset can be used in a cross-asset settle).
+    fn lookup_asset_symbol(env: &Env, asset_id_hash: &BytesN<32>) -> Symbol {
+        env.storage().persistent().get(&DataKey::AssetSymbol(asset_id_hash.clone()))
+            .unwrap_or_else(|| panic_err(env, Error::UnknownAsset))
+    }
+
+    /// multi-asset: fetch Reflector's lastprice for a ticker (e.g. "XLM"),
+    /// enforcing the staleness window. Returns the raw i128 price (scaled by
+    /// RATE_SCALE, matching Reflector's decimals() convention).
+    fn reflector_lastprice(env: &Env, oracle: &Address, symbol: &Symbol) -> i128 {
+        let asset = ReflectorAsset::Other(symbol.clone());
+        let result: Option<ReflectorPriceData> = env.invoke_contract(
+            oracle,
+            &Symbol::new(env, "lastprice"),
+            vec![env, asset.into_val(env)],
+        );
+        let data = result.unwrap_or_else(|| panic_err(env, Error::RateStale));
+        let now = env.ledger().timestamp();
+        if now.saturating_sub(data.timestamp) > RATE_STALENESS_SECS {
+            panic_err(env, Error::RateStale);
+        }
+        data.price
+    }
+
+    /// multi-asset: validate the mpc_settle proof-bound `rate` (assetIdA priced
+    /// in assetIdB, scaled by RATE_SCALE) against Reflector, within
+    /// RATE_DEVIATION_BPS. Same-asset settles (assetIdA == assetIdB) skip the
+    /// oracle entirely and just require rate == RATE_SCALE (a pure 1:1 note
+    /// split/merge has no exchange rate to validate).
+    fn validate_cross_asset_rate(
+        env: &Env,
+        asset_id_a: &BytesN<32>,
+        asset_id_b: &BytesN<32>,
+        rate: i128,
+    ) {
+        if asset_id_a == asset_id_b {
+            if rate != RATE_SCALE {
+                panic_err(env, Error::RateDeviation);
+            }
+            return;
+        }
+        let oracle: Address = env.storage().instance().get(&REFLECTOR)
+            .unwrap_or_else(|| panic_err(env, Error::ReflectorNotConfigured));
+        let symbol_a = Self::lookup_asset_symbol(env, asset_id_a);
+        let symbol_b = Self::lookup_asset_symbol(env, asset_id_b);
+        let price_a = Self::reflector_lastprice(env, &oracle, &symbol_a); // A priced in USD, RATE_SCALE
+        let price_b = Self::reflector_lastprice(env, &oracle, &symbol_b); // B priced in USD, RATE_SCALE
+        if price_a <= 0 || price_b <= 0 {
+            panic_err(env, Error::RateStale);
+        }
+        // oracle_rate = price(A in B) = price_a / price_b, rescaled to RATE_SCALE.
+        let oracle_rate = price_a.saturating_mul(RATE_SCALE) / price_b;
+        let diff = if rate > oracle_rate { rate - oracle_rate } else { oracle_rate - rate };
+        // diff * 10000 <= oracle_rate * RATE_DEVIATION_BPS  <=>  relative diff <= tolerance
+        if diff.saturating_mul(10_000) > oracle_rate.saturating_mul(RATE_DEVIATION_BPS) {
+            panic_err(env, Error::RateDeviation);
+        }
     }
 
     /// C4 Authorize (or revoke) a solver ed25519 public key for RFQ settlement.
@@ -476,6 +633,14 @@ impl ShieldedPool {
         let amount: i128 = fr32_to_i128(&signals.get(2).unwrap()); // P1.5 layout: value@2
         let deadline_ledger: i128 = fr32_to_i128(&signals.get(5).unwrap());
         let state_root: BytesN<32> = signals.get(6).unwrap();      // P1.5 layout: stateRoot@6
+        // multi-asset: Stellar CCTP outbound only ever moves USDC — a note of any
+        // other asset must not be allowed to trigger a CCTP burn. [17] assetId is
+        // Merkle-bound to the spent note, so this rejects non-USDC notes outright.
+        let asset_id: BytesN<32> = signals.get(17).unwrap();
+        let usdc: Address = env.storage().instance().get(&USDC).unwrap();
+        if asset_id != Self::recipient_hash(&env, &usdc) {
+            panic_err(&env, Error::CctpAssetMustBeUsdc);
+        }
         if amount <= 0 {
             panic_err(&env, Error::BadAmount);
         }
@@ -527,8 +692,8 @@ impl ShieldedPool {
         // USDC from the pool via SEP-41 `transfer_from`, so the pool must approve
         // the TMM as spender for `amount + max_fee` first. The pool is the caller;
         // its contract invocation authorizes both the approve and the burn.
+        // (`usdc` already fetched above for the assetId == USDC check.)
         let tmm: Address = env.storage().instance().get(&TMM).unwrap();
-        let usdc: Address = env.storage().instance().get(&USDC).unwrap();
         let pool = env.current_contract_address();
         let pull_amount = amount + if max_fee > 0 { max_fee } else { 0 };
         let token_client = token::TokenClient::new(&env, &usdc);
@@ -602,6 +767,9 @@ impl ShieldedPool {
         let relayer_fee: i128 = fr32_to_i128(&signals.get(4).unwrap());
         let deadline_ledger: i128 = fr32_to_i128(&signals.get(5).unwrap());
         let state_root: BytesN<32> = signals.get(6).unwrap();      // P1.5 layout: stateRoot@6
+        // multi-asset: [17] assetId — Merkle-bound to the spent note; the solver
+        // is reimbursed in the asset the user's note actually holds.
+        let asset_id: BytesN<32> = signals.get(17).unwrap();
         if credit <= 0 || relayer_fee < 0 || relayer_fee > credit {
             panic_err(&env, Error::BadAmount);
         }
@@ -650,9 +818,9 @@ impl ShieldedPool {
             vec![&env, env.current_contract_address().to_val(), nullifier_hash.clone().to_val()],
         );
 
-        // Reimburse the solver from the pool.
-        let usdc: Address = env.storage().instance().get(&USDC).unwrap();
-        let client = token::TokenClient::new(&env, &usdc);
+        // Reimburse the solver from the pool, in the asset the settled note holds.
+        let asset_sac = Self::lookup_asset_sac(&env, &asset_id);
+        let client = token::TokenClient::new(&env, &asset_sac);
         if client.balance(&env.current_contract_address()) < credit {
             panic_err(&env, Error::InsufficientBalance);
         }
@@ -660,7 +828,7 @@ impl ShieldedPool {
 
         env.events().publish(
             (symbol_short!("rfq"), quote_hash),
-            (to_solver, nullifier_hash, credit),
+            (to_solver, nullifier_hash, credit, asset_sac),
         );
     }
 
@@ -777,13 +945,14 @@ impl ShieldedPool {
 
         // Phase C: ZK proof verification (required when mpc_verifier is configured).
         //
-        // mpc_settlement public signal layout:
+        // mpc_settlement public signal layout (multi-asset):
         //   [0] nullifierHashA   [1] nullifierHashB
         //   [2] outputCommitmentA [3] outputCommitmentB
         //   [4] stateRoot         [5] associationRoot
         //   [6] batchHash (= hashToField(batch_hash))
         //   [7] poolId            [8] chainId
         //   [9] matchedAmount7dp  [10] deadlineLedger
+        //   [11] assetIdA         [12] assetIdB       [13] rate
         if let Some(mpc_verifier) = env.storage().instance().get::<Symbol, Address>(&MPC_VERIFIER) {
             let pb = proof_bytes.unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
             let sb = pub_signals_bytes.unwrap_or_else(|| panic_err(&env, Error::MpcProofInvalid));
@@ -833,6 +1002,16 @@ impl ShieldedPool {
             if pool_in != pool_id as i128 || chain_in != chain_id as i128 {
                 panic_err(&env, Error::WrongDomain);
             }
+            // multi-asset: [11][12][13] assetIdA/assetIdB/rate — validate the
+            // proof-bound exchange rate against the Reflector oracle (or require
+            // exactly 1:1 for a same-asset settle). The circuit already used
+            // assetIdA/assetIdB to construct outputCommitmentA/B (see
+            // circuits/mpc_settlement/main.circom step 5), so this is the one
+            // place economic correctness of a cross-asset match is enforced.
+            let asset_id_a: BytesN<32> = signals.get(11).unwrap();
+            let asset_id_b: BytesN<32> = signals.get(12).unwrap();
+            let rate: i128 = fr32_to_i128(&signals.get(13).unwrap());
+            Self::validate_cross_asset_rate(&env, &asset_id_a, &asset_id_b, rate);
         }
 
         // Spend both nullifiers atomically.  NullifierRegistry.spend panics if already used.
