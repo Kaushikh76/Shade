@@ -110,6 +110,12 @@ const gates: Gate[] = [
     // REQUIRE mpc_settle to bind the canonical association root and the deadline.
     name: "mpc_settle binds canonical association root + deadline (B2)",
     cmd: `( grep -q "canonical_assoc" contracts/stellar/shielded_pool/src/lib.rs && grep -q "deadline_ledger" contracts/stellar/shielded_pool/src/lib.rs ) && echo "" || echo MPC_B2_BINDING_MISSING`
+  },
+  {
+    // Phase 2: withdraw must select the token from the asset registry by the
+    // note's assetId signal and debit per-asset supply — never a hardcoded USDC.
+    name: "withdraw is asset-bound: reads assetId signal + per-asset supply (Phase 2)",
+    cmd: `( grep -q "let asset_id: BytesN<32> = signals.get(17)" contracts/stellar/shielded_pool/src/lib.rs && grep -q "adjust_note_supply(&env, &asset_id, -withdrawn_value)" contracts/stellar/shielded_pool/src/lib.rs ) && echo "" || echo WITHDRAW_NOT_ASSET_BOUND`
   }
 ];
 

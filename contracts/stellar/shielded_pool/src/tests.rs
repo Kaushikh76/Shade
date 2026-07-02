@@ -172,6 +172,101 @@ fn mpc_settle_rejects_duplicate_signer_replay() {
     assert!(result.is_err(), "duplicate signer must not satisfy the committee threshold");
 }
 
+// ---- Phase 2 withdraw asset-binding (spec §6.4/§6.6/§6.8) ----
+
+/// Replicate the contract's recipient_hash: sha256(strkey[56]) then hash_to_field
+/// (leading zero byte + first 31 bytes).
+fn recip_hash(env: &Env, to: &Address) -> [u8; 32] {
+    let s = to.to_string();
+    let mut buf = [0u8; 56];
+    s.copy_into_slice(&mut buf);
+    let sha: [u8; 32] = env.crypto().sha256(&Bytes::from_slice(env, &buf)).to_array();
+    let mut out = [0u8; 32];
+    for i in 0..31 {
+        out[i + 1] = sha[i];
+    }
+    out
+}
+
+struct WithdrawHarness {
+    env: Env,
+    pool: ShieldedPoolClient<'static>,
+    to: Address,
+    token_admin: soroban_sdk::token::StellarAssetClient<'static>,
+    asset_id: BytesN<32>,
+}
+
+fn setup_withdraw() -> WithdrawHarness {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let usdc = Address::generate(&env);
+    let verifier = env.register(MockVerifierAccept, ()); // accepts the withdraw proof
+    let nullreg = env.register(MockNullifierRegistry, ());
+    let pool_id = env.register(
+        ShieldedPool,
+        (admin.clone(), usdc, verifier, nullreg, 12u32, 1u32, 27u32),
+    );
+    let pool = ShieldedPoolClient::new(&env, &pool_id);
+
+    // Register an asset backed by a real SAC and fund the pool with it.
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    let token_addr = sac.address();
+    let asset_id = BytesN::from_array(&env, &[0x44u8; 32]);
+    pool.register_asset(&asset_id, &token_addr);
+    let token_admin = soroban_sdk::token::StellarAssetClient::new(&env, &token_addr);
+    token_admin.mint(&pool_id, &10_000_000i128);
+
+    let to = Address::generate(&env);
+    WithdrawHarness { env, pool, to, token_admin, asset_id }
+}
+
+/// Build a valid 18-word withdraw public-signal blob (assoc root = 0 default,
+/// state root = empty root, poolId=1, chainId=27).
+fn withdraw_signals(env: &Env, to: &Address, withdrawn: u128, asset_id_bytes: [u8; 32]) -> Bytes {
+    let words: [[u8; 32]; 18] = [
+        [1u8; 32],                 // [0] nullifierHash
+        enc_u128(1),               // [1] operationType = OP_WITHDRAW_PUBLIC
+        enc_u128(withdrawn),       // [2] withdrawnValue
+        recip_hash(env, to),       // [3] recipientHash
+        [0u8; 32],                 // [4] relayerFee
+        enc_u128(999_999),         // [5] deadlineLedger
+        [0u8; 32],                 // [6] stateRoot (empty root, known)
+        [0u8; 32],                 // [7] associationRoot (default 0)
+        enc_u128(1),               // [8] poolId
+        enc_u128(27),              // [9] chainId
+        [0u8; 32], [0u8; 32], [0u8; 32],           // [10-12] quote/intent/fill
+        [0u8; 32], [0u8; 32], [0u8; 32], [0u8; 32],// [13-16] cctp dest fields
+        asset_id_bytes,            // [17] assetId
+    ];
+    build_signals(env, &words)
+}
+
+#[test]
+fn withdraw_selects_token_by_asset_and_debits_supply() {
+    let w = setup_withdraw();
+    let env = &w.env;
+    let token = soroban_sdk::token::TokenClient::new(env, &w.token_admin.address);
+    let signals = withdraw_signals(env, &w.to, 4_000_000, w.asset_id.to_array());
+    let proof = Bytes::from_array(env, &[0u8; 8]);
+
+    w.pool.withdraw(&w.to, &proof, &signals);
+
+    assert_eq!(token.balance(&w.to), 4_000_000, "recipient receives the asset's token");
+    assert_eq!(w.pool.note_supply(&w.asset_id), -4_000_000, "note supply debited by withdrawnValue");
+}
+
+#[test]
+fn withdraw_unknown_asset_rejected() {
+    let w = setup_withdraw();
+    let env = &w.env;
+    // signal[17] points at an asset that was never registered -> fail closed.
+    let signals = withdraw_signals(env, &w.to, 1_000_000, [0x99u8; 32]);
+    let proof = Bytes::from_array(env, &[0u8; 8]);
+    let result = w.pool.try_withdraw(&w.to, &proof, &signals);
+    assert!(result.is_err(), "withdraw for an unregistered asset must fail closed");
+}
+
 // ---- Phase 2 asset registry (spec §6.5/§6.8) ----
 
 #[test]

@@ -265,6 +265,10 @@ impl ShieldedPool {
         env.storage().instance().set(&TREE_ROOT_KEY, &new_root);
         env.storage().persistent().set(&DataKey::KnownRoot(new_root.clone()), &true);
         env.storage().persistent().set(&DataKey::Deposit(cctp_nonce.clone()), &true);
+        // Phase 2 (spec §6.6): the minted note enters the shielded set for its
+        // asset. signal[8] (assetIdHash) IS the field asset id; the asset must be
+        // registered (fail closed) so per-asset supply/reserves stay consistent.
+        Self::adjust_note_supply(&env, &signals.get(8).unwrap(), amount);
         env.events().publish(
             (symbol_short!("deposit"), source_domain),
             (cctp_nonce, asset, amount, commitment, encrypted_note_payload_hash, policy_id, leaf_index, new_root),
@@ -288,6 +292,10 @@ impl ShieldedPool {
         let relayer_fee: i128 = fr32_to_i128(&signals.get(4).unwrap());
         let deadline_ledger: i128 = fr32_to_i128(&signals.get(5).unwrap());
         let state_root: BytesN<32> = signals.get(6).unwrap();
+        // Phase 2 (spec §6.4): the note's asset id is a public signal bound into
+        // the commitment. The contract releases the token registered for THIS
+        // asset — never a hardcoded USDC — and fails closed on an unknown asset.
+        let asset_id: BytesN<32> = signals.get(17).unwrap();
 
         // P1.5 enforce operation type.
         if op_type != OP_WITHDRAW_PUBLIC {
@@ -329,14 +337,19 @@ impl ShieldedPool {
             vec![&env, env.current_contract_address().to_val(), nullifier_hash.clone().to_val()],
         );
 
-        // Release net (withdrawnValue - relayerFee) to the recipient; fee stays.
+        // Release net (withdrawnValue - relayerFee) in the NOTE'S asset to the
+        // recipient; fee stays. The token is resolved from the asset registry —
+        // get_asset_token fails closed (UnknownAsset) for an unregistered asset,
+        // and a USDC note can never move the XLM token or vice versa.
         let net = withdrawn_value - relayer_fee;
-        let usdc: Address = env.storage().instance().get(&USDC).unwrap();
-        let client = token::TokenClient::new(&env, &usdc);
+        let token: Address = Self::get_asset_token(env.clone(), asset_id.clone());
+        let client = token::TokenClient::new(&env, &token);
         if client.balance(&env.current_contract_address()) < net {
             panic_err(&env, Error::InsufficientBalance);
         }
         client.transfer(&env.current_contract_address(), &to, &net);
+        // Phase 2 (spec §6.6): the withdrawn value leaves the shielded set.
+        Self::adjust_note_supply(&env, &asset_id, -withdrawn_value);
 
         env.events().publish((symbol_short!("withdraw"),), (to, nullifier_hash, net, relayer_fee));
     }
@@ -497,9 +510,7 @@ impl ShieldedPool {
     }
 
     /// Internal: adjust a registered asset's note supply by `delta` (may be
-    /// negative). Requires the asset to be registered. Wired into the asset-bound
-    /// deposit/withdraw paths in the commitment-binding change.
-    #[allow(dead_code)]
+    /// negative). Requires the asset to be registered (fails closed otherwise).
     fn adjust_note_supply(env: &Env, asset_id: &BytesN<32>, delta: i128) {
         if env.storage().persistent().get::<DataKey, Address>(&DataKey::AssetToken(asset_id.clone())).is_none() {
             panic_err(env, Error::UnknownAsset);

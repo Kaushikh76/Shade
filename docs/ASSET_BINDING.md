@@ -2,8 +2,10 @@
 
 > Testnet only; no mainnet claim. Spec: `shade_testnet_e2e_agent_build_spec.md` §6.
 
-Two parts: the **asset registry** (done) and the **asset-bound commitment**
-(in progress).
+Status: the **asset registry**, the **asset-bound commitment**, and the
+**contract enforcement** for the deposit/withdraw path are done and green
+(`npm run ci:full`). private_transfer is asset-bound in-circuit; the MPC
+settlement asset signals land with Phase 5/6.
 
 ## Asset registry (done)
 
@@ -17,7 +19,18 @@ Two parts: the **asset registry** (done) and the **asset-bound commitment**
   `hash_to_field` reduction the circuits and contract use (valid on BN254 and
   BLS12-381). Tests in `packages/assets/src/assets-test.ts`.
 
-## Asset-bound commitment (in progress)
+## Contract enforcement (done)
+
+- `withdraw` reads the `assetId` public signal (index 17), releases the token
+  registered for THAT asset via `get_asset_token` (fails closed on an unknown
+  asset — a USDC note can never move the XLM token), and debits per-asset note
+  supply. `receive_cctp_deposit` credits per-asset supply from its `assetIdHash`
+  signal. Tests: withdraw selects token by asset + debits supply; unknown-asset
+  withdraw rejected; registry register/lookup/reserves.
+- `scripts/deploy-shielded-pool.ts` registers USDC (and XLM if
+  `STELLAR_TESTNET_XLM_SAC_CONTRACT` is set) on the pool after deploy.
+
+## Asset-bound commitment (done)
 
 The commitment value must include `assetId`. The **real** current commitment
 (coinutils + the working circuits — NOT the stale `circuits/lib/commitment.circom`)
