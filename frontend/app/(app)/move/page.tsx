@@ -121,10 +121,35 @@ function Withdraw() {
   )
 }
 
-// Atomic cross-asset swap: spend a private USDC note -> receive XLM. The pool pays
-// both legs in one on-chain tx (rfq_settle_atomic_swap) — XLM to the user, USDC to
-// the solver — gated by the user's ZK proof (op=5) + the solver-signed swap terms.
-const PRICE_XLM_PER_USDC = 2.0 // matches RFQ_SWAP_PRICE_SCALED (2_000_000_000 / 1e9)
+// The Swap page has two modes for turning a private USDC note into XLM:
+//  - Solver (RFQ): a solver quotes + signs, pool settles atomically (rfq_settle_atomic_swap).
+//    The amount is visible to the solver. Cross-asset payout to your Stellar account.
+//  - Private Match (MPC): a threshold committee crosses your note against a counterparty
+//    note note<->note (mpc_settle_priced). The amount is revealed to no single party.
+type Mode = "solver" | "match"
+
+const MODES: Record<Mode, {
+  label: string; endpoint: string; circuit: string; price: number; priceUnit: string
+  desc: string; cta: string; ctaBusy: string; success: (xlm: string) => string
+  logTitle: string; outField: string; nullSignals: string
+}> = {
+  solver: {
+    label: "Solver (RFQ)", endpoint: "/v1/rfq/assist", circuit: "rfq_atomic_swap",
+    price: 2.0, priceUnit: "XLM/USDC",
+    desc: "Solver-quoted, signed (ed25519), and settled atomically on-chain (rfq_settle_atomic_swap). One transaction: XLM to you, USDC to the solver.",
+    cta: "Swap note for XLM", ctaBusy: "Proving + settling…",
+    success: (xlm) => `Swapped · nullifier spent · ${xlm} XLM delivered`,
+    logTitle: "Prover + Solver + Stellar · atomic USDC→XLM swap", outField: "quotedOutputXlm", nullSignals: "1",
+  },
+  match: {
+    label: "Private Match (MPC)", endpoint: "/v1/mpc/assist", circuit: "mpc_priced_settlement",
+    price: 1.0, priceUnit: "XLM/USDC",
+    desc: "Crossed against a counterparty note by a 3-node MPC committee (threshold ed25519), settled note↔note on-chain (mpc_settle_priced). The amount is revealed to no single party.",
+    cta: "Match privately for XLM", ctaBusy: "Proving + crossing…",
+    success: (xlm) => `Matched · 2 nullifiers spent · ${xlm} XLM note received`,
+    logTitle: "Prover + Committee + Stellar · private USDC↔XLM match", outField: "outputXlm", nullSignals: "2",
+  },
+}
 
 function Swap() {
   const { authenticated } = usePrivy()
@@ -133,33 +158,43 @@ function Swap() {
   const qc = useQueryClient()
   const active = (notes.data?.notes ?? []).filter((n) => n.status === "active")
 
+  const [mode, setMode] = useState<Mode>("solver")
   const [selected, setSelected] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [jobId, setJobId] = useState<string | undefined>()
-  const [zk, setZk] = useState<ZkState>({ circuit: "rfq_atomic_swap" })
+  const [zk, setZk] = useState<ZkState>({ circuit: MODES.solver.circuit })
   const [error, setError] = useState<string | null>(null)
   const [done, setDone] = useState<{ tx: string; xlm: string } | null>(null)
 
+  const cfg = MODES[mode]
   const commitment = selected ?? active[0]?.commitment ?? null
   const note = active.find((n) => n.commitment === commitment) ?? active[0]
   const inUsdc = note ? Number(note.amount_usdc_7dp) / 1e7 : 0
-  const outXlm = inUsdc * PRICE_XLM_PER_USDC
+  const outXlm = inUsdc * cfg.price
+
+  function pickMode(m: Mode) {
+    if (busy) return
+    setMode(m); setError(null); setDone(null); setJobId(undefined)
+    setZk({ circuit: MODES[m].circuit })
+  }
 
   async function run() {
     if (!commitment) return
     setBusy(true); setError(null); setJobId(undefined); setDone(null)
-    setZk({ circuit: "rfq_atomic_swap", verifier: contracts.data?.verifierWithdraw, proving: true, publicSignals: [{ label: "note", value: commitment }, { label: "output", value: "XLM" }] })
+    const signals = [{ label: "note", value: commitment }, { label: "output", value: "XLM" }]
+    if (mode === "match") signals.push({ label: "committee", value: "3-of-3 threshold" })
+    setZk({ circuit: cfg.circuit, verifier: contracts.data?.verifierWithdraw, proving: true, publicSignals: signals })
     try {
-      const res = await api.post<{ job_id: string }>("/v1/rfq/assist", { commitment })
+      const res = await api.post<{ job_id: string }>(cfg.endpoint, { commitment })
       setJobId(res.job_id)
       for (let i = 0; i < 120; i++) {
         await new Promise((r) => setTimeout(r, 2000))
         const job = await api.get<{ status: string; result: Record<string, unknown> | null; error: string | null }>(`/v1/jobs/${res.job_id}`)
         if (job.status === "ready") {
           const tx = String(job.result?.txHash ?? "")
-          const xlm = String(job.result?.quotedOutputXlm ?? outXlm.toFixed(4))
+          const xlm = String(job.result?.[cfg.outField] ?? outXlm.toFixed(4))
           setDone({ tx, xlm })
-          setZk((z) => ({ ...z, proving: false, verifiedOnChain: true, txHash: tx, nullifier: commitment }))
+          setZk((z) => ({ ...z, proving: false, verifiedOnChain: true, txHash: tx, nullifier: String(job.result?.nullifierA ?? commitment) }))
           await qc.invalidateQueries({ queryKey: ["my-notes"] })
           await qc.invalidateQueries({ queryKey: ["activity"] })
           break
@@ -176,8 +211,23 @@ function Swap() {
 
   return (
     <div className="space-y-6">
+      {/* Mode toggle: Solver (RFQ) vs Private Match (MPC) */}
+      <div className="grid grid-cols-2 gap-2 rounded-xl border border-border bg-black/20 p-1.5">
+        {(Object.keys(MODES) as Mode[]).map((m) => (
+          <button
+            key={m}
+            onClick={() => pickMode(m)}
+            className={`rounded-lg px-4 py-2.5 font-mono text-xs uppercase tracking-wider transition-colors ${
+              mode === m ? "bg-[#2563eb]/15 text-foreground" : "text-muted-foreground hover:text-foreground"
+            }`}
+          >
+            {MODES[m].label}
+          </button>
+        ))}
+      </div>
+
       <div className="rounded-xl border border-border bg-black/30 p-6">
-        <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Private note to swap</p>
+        <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Private note to convert</p>
         {active.length === 0 ? (
           <p className="mt-3 font-mono text-xs text-muted-foreground">no active notes — <a href="/deposit" className="text-[#2563eb] hover:underline">shield some USDC first</a>.</p>
         ) : (
@@ -197,7 +247,7 @@ function Swap() {
           </div>
         )}
 
-        {/* Swap preview: USDC in -> XLM out */}
+        {/* Preview: USDC in -> XLM out */}
         <div className="mt-5 flex items-center justify-between gap-4 rounded-lg border border-border bg-black/40 px-4 py-4">
           <div className="text-center">
             <p className="font-sans text-2xl font-light" style={{ color: "#EDEAE3" }}>{inUsdc.toFixed(2)}</p>
@@ -206,12 +256,12 @@ function Swap() {
           <ArrowLeftRight className="h-5 w-5 shrink-0 text-[#2563eb]" />
           <div className="text-center">
             <p className="font-sans text-2xl font-light" style={{ color: "#EDEAE3" }}>{outXlm.toFixed(2)}</p>
-            <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">XLM · to you</p>
+            <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">XLM · {mode === "match" ? "matched" : "to you"}</p>
           </div>
         </div>
-        <p className="mt-3 flex items-center gap-2 font-mono text-xs text-muted-foreground">
-          <ArrowUpRight className="h-4 w-4 text-[#2563eb]" />
-          Solver-quoted at {PRICE_XLM_PER_USDC.toFixed(1)} XLM/USDC · atomic on-chain settle (rfq_settle_atomic_swap)
+        <p className="mt-3 flex items-start gap-2 font-mono text-xs leading-relaxed text-muted-foreground">
+          <ArrowUpRight className="mt-0.5 h-4 w-4 shrink-0 text-[#2563eb]" />
+          <span>{cfg.price.toFixed(1)} {cfg.priceUnit} · {cfg.desc}</span>
         </p>
 
         <button
@@ -219,17 +269,17 @@ function Swap() {
           disabled={busy || !commitment}
           className="mt-5 w-full rounded-full border border-[#2563eb]/40 bg-[#2563eb]/10 px-6 py-3 font-mono text-xs uppercase tracking-wider text-foreground transition-colors hover:bg-[#2563eb]/20 disabled:opacity-40"
         >
-          {busy ? "Proving + settling…" : "Swap note for XLM"}
+          {busy ? cfg.ctaBusy : cfg.cta}
         </button>
         {error && <p className="mt-3 font-mono text-xs text-red-400">error: {error}</p>}
         {done && (
           <div className="mt-4 flex items-center gap-2 rounded-lg border border-emerald-400/25 bg-emerald-400/5 px-4 py-2.5 font-mono text-xs text-emerald-400">
-            <Check className="h-3.5 w-3.5" /> Swapped · nullifier spent · {done.xlm} XLM delivered
+            <Check className="h-3.5 w-3.5" /> {cfg.success(done.xlm)}
           </div>
         )}
       </div>
 
-      {jobId && <LiveLog jobId={jobId} title="Prover + Solver + Stellar · atomic USDC→XLM swap" />}
+      {jobId && <LiveLog jobId={jobId} title={cfg.logTitle} />}
       {(jobId || busy) && <ZkPanel state={zk} />}
     </div>
   )

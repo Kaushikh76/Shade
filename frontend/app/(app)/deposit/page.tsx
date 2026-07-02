@@ -9,6 +9,7 @@ import { api, newIdempotencyKey } from "@/lib/api"
 import { useNoteVaults, isDepositReady } from "@/lib/vault-hooks"
 import { LiveLog } from "@/components/live-log"
 import { ZkPanel, type ZkState } from "@/components/zk-panel"
+import { TxLink } from "@/components/tx-link"
 import { useContracts } from "@/lib/hooks"
 import { ArrowDown, Check, Loader2 } from "lucide-react"
 
@@ -19,7 +20,7 @@ const BURN_6DP = "505000"
 const POLICY = "shade:default-testnet-policy:v1"
 const ARB_RPC = "https://sepolia-rollup.arbitrum.io/rpc"
 
-type Step = { label: string; status: "idle" | "running" | "done" | "error"; detail?: string }
+type Step = { label: string; status: "idle" | "running" | "done" | "error"; detail?: string; tx?: string; chain?: "stellar" | "arb" }
 const coerce = (a: unknown) => (typeof a === "string" && /^\d+$/.test(a) ? BigInt(a) : a)
 
 async function sha256Hex(s: string): Promise<string> {
@@ -105,7 +106,7 @@ export default function DepositPage() {
         ...gas,
       })
       await pub.waitForTransactionReceipt({ hash: approveHash })
-      setStep(2, { status: "done", detail: approveHash.slice(0, 10) })
+      setStep(2, { status: "done", tx: approveHash, chain: "arb" })
 
       setStep(3, { status: "running", detail: "confirm in MetaMask" })
       const burnHash = await walletClient.writeContract({
@@ -116,7 +117,7 @@ export default function DepositPage() {
         ...gas,
       })
       await pub.waitForTransactionReceipt({ hash: burnHash })
-      setStep(3, { status: "done", detail: burnHash.slice(0, 10) })
+      setStep(3, { status: "done", tx: burnHash, chain: "arb" })
 
       // 5) hand the burn to the relayer; it validates, mints on Stellar, generates
       // the deposit ZK proof, and registers the note on-chain.
@@ -207,6 +208,7 @@ export default function DepositPage() {
                 : <span className="h-3.5 w-3.5 rounded-full border border-muted-foreground/40" />}
               <span className={s.status === "done" ? "text-foreground/80" : "text-muted-foreground"}>{s.label}</span>
               {s.detail && <span className="text-emerald-400/80">· {s.detail}</span>}
+              {s.tx && <span className="text-muted-foreground">· <TxLink hash={s.tx} chain={s.chain} /></span>}
             </div>
           ))}
           {error && <p className="pt-2 font-mono text-xs text-red-400">error: {error}</p>}

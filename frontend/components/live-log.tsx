@@ -4,6 +4,26 @@
 // streams its event timeline. Used on every action page (deposit/withdraw/rfq/exit).
 import { useQuery } from "@tanstack/react-query"
 import { api } from "@/lib/api"
+import { TxLink } from "@/components/tx-link"
+
+// Human labels for the tx-hash fields a relayer job result may carry.
+const TX_LABELS: Record<string, string> = {
+  txHash: "settle tx",
+  receiveDepositTxHash: "shield tx",
+  mintForwardTxHash: "mint tx",
+  burnTxHash: "burn tx",
+  fillTxHash: "fill tx",
+  mintTxHash: "mint tx",
+}
+function txFields(result: Record<string, unknown> | null): { label: string; hash: string }[] {
+  if (!result) return []
+  const out: { label: string; hash: string }[] = []
+  for (const [k, v] of Object.entries(result)) {
+    if (typeof v !== "string" || !/Hash$/.test(k)) continue
+    if (/^0x[a-fA-F0-9]{64}$/.test(v) || /^[A-Fa-f0-9]{64}$/.test(v)) out.push({ label: TX_LABELS[k] ?? k, hash: v })
+  }
+  return out
+}
 
 type JobEvent = { status: string; detail: string | null; created_at: string }
 type Job = {
@@ -47,6 +67,16 @@ export function LiveLog({ jobId, title = "Live log" }: { jobId?: string; title?:
         ))}
         {data?.error && <div className="py-0.5 text-red-400">error: {data.error}</div>}
       </div>
+      {txFields(data?.result ?? null).length > 0 && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-border px-4 py-2.5">
+          {txFields(data?.result ?? null).map((t, i) => (
+            <span key={i} className="flex items-center gap-1.5 font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
+              {t.label}
+              <TxLink hash={t.hash} />
+            </span>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
