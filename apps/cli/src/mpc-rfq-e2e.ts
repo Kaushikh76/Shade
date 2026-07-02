@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 /**
  * MPC-RFQ integrated e2e test (Phase A).
  *
@@ -42,8 +43,11 @@ const headers: Record<string, string> = {
 
 async function api<T>(method: string, path: string, body?: unknown): Promise<T> {
   const res = await fetch(`${API}${path}`, {
-    method, headers,
-    body: body ? JSON.stringify(body) : undefined
+    method,
+    headers: { ...headers, "idempotency-key": `mpcrfq-${randomUUID()}` },
+    // Fastify rejects an application/json request with an empty body; send {} for
+    // bodyless POSTs (e.g. the match trigger).
+    body: body ? JSON.stringify(body) : (method === "POST" ? "{}" : undefined)
   });
   if (!res.ok) {
     const text = await res.text();
@@ -209,28 +213,70 @@ try {
 }
 
 // ── 7. Verify the settlement gate: MPC-routed intent must have a match ────────
-// We call POST /v1/rfq/settle with a synthetic payload and expect a 409 with the
-// lifecycle error (proof not ready), NOT the MPC gate error — which proves the
-// gate passes once the match is confirmed.
-// If the match was NOT recorded, we'd get the MPC gate error instead.
+// Register a real quote for intent A so settle passes the quote check and reaches
+// the proof gate ("proof job is not ready"). If the MPC match were NOT confirmed,
+// the MPC gate would fire instead — so reaching the proof gate proves the MPC gate
+// passed on a confirmed match.
+
+const quoteId = randomUUID();
+try {
+  await api("POST", "/v1/solver/quotes", {
+    quote_id: quoteId,
+    intent_hash: intentHashA,
+    solver_id: "solver-mpcrfq-e2e",
+    input_asset: "USDC:Stellar:SAC",
+    output_asset: "USDC:ArbitrumSepolia",
+    gross_input: "1.0",
+    net_output: "0.99",
+    fee: "0.01",
+    valid_until_ledger: 999_999_999,
+    solver_inventory_commitment: fakeCommitment("inv"),
+    settlement_method: "proof_of_fill",
+    quote_signature: "0x" + "00".repeat(64)
+  });
+  check("Solver quote registered for intent A", true, `quote ${quoteId.slice(0, 12)}...`);
+} catch (e) {
+  check("Solver quote registered for intent A", false, String(e));
+}
+
+try {
+  await api(`POST`, `/v1/quotes/${quoteId}/accept`, {
+    intent_hash: intentHashA,
+    user_signature_hash: fakeCommitment("user-accept-sig")
+  });
+  check("Quote accepted (RFQ lifecycle)", true, "accepted");
+} catch (e) {
+  check("Quote accepted (RFQ lifecycle)", false, String(e));
+}
+
+const fillReceiptHash = fakeCommitment("fill");
+let fillId = "";
+try {
+  const r = await api<{ fill_id: string }>("POST", "/v1/fills", {
+    quote_id: quoteId, fill_receipt_hash: fillReceiptHash, amount: "990000", recipient: "0xrecipient"
+  });
+  fillId = r.fill_id;
+  await api("POST", `/v1/fills/${fillId}/execute`, { destination_tx_hash: "0x" + "ab".repeat(32) });
+  check("Fill created + executed (RFQ lifecycle)", true, `fill ${fillId.slice(0, 12)}...`);
+} catch (e) {
+  check("Fill created + executed (RFQ lifecycle)", false, String(e));
+}
 
 try {
   await api("POST", "/v1/rfq/settle", {
     intent_hash: intentHashA,
-    quote_id: "00000000-0000-0000-0000-000000000000",
+    quote_id: quoteId,
     proof_job_id: "nonexistent-proof-job",
     nullifier: fakeCommitment("nullifier-a"),
-    fill_receipt_hash: fakeCommitment("fill")
+    fill_receipt_hash: fillReceiptHash
   });
-  // Reaching here means settle succeeded — unexpected in a test with no real proof
   check("Settlement gate: MPC match passes, proof gate fires", false, "settle unexpectedly succeeded");
 } catch (e) {
   const msg = String(e);
-  // We expect "proof job is not ready" — NOT "MPC match not yet confirmed"
   const proofGate = /proof job is not ready|proof.*not ready/i.test(msg);
   const mpcGate = /MPC match not yet confirmed/i.test(msg);
   check("Settlement gate: MPC match passes, proof gate fires", proofGate && !mpcGate,
-    proofGate ? "proof gate fired (MPC gate already passed ✓)" : `unexpected: ${msg.slice(0, 120)}`);
+    proofGate ? "proof gate fired (MPC gate already passed)" : `unexpected: ${msg.slice(0, 120)}`);
 }
 
 // ── 8. Verify the batch signature ────────────────────────────────────────────
